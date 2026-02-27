@@ -1,0 +1,10 @@
+streamlit>=1.32
+pandas>=2.0
+numpy>=1.26.4
+scipy>=1.10
+matplotlib>=3.7
+seaborn>=0.13
+adjustText>=1.1
+Pillow>=10.0
+alphacast==0.1.8.7
+python-docx>=1.1
