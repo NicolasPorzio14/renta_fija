@@ -1,22 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-Curvas de ONs y Bonos — versión PRO
------------------------------------
-Mejoras sobre la versión original:
-  * Gráficos interactivos Plotly con estética institucional (reemplazan matplotlib/seaborn)
-  * Fit Nelson-Siegel con análisis cheap/rich (residuos vs curva, en bps)
-  * Z-score del spread por legislación (AL/AE vs GD) con señal de arbitraje
-  * Métricas clave para el asesor: carry, TIR/MD, convexidad, pendiente de curva
-  * Breakeven de inflación (CER vs tasa fija) y de devaluación (Dollar Linked vs tasa fija)
-  * Comparación breakeven vs REM (BCRA, dataset 5621) y vs futuros MATBA-ROFEX (dataset 5331)
-  * Insights automáticos generados a partir de los datos
+Curvas de ONs y Bonos — versión PRO v2 (FIX de datasets + Carry Trade)
+-----------------------------------------------------------------------
+CAMBIOS RESPECTO A LA VERSIÓN ANTERIOR (por qué el breakeven no andaba bien):
+
+  1) DATASET_RF_SOBERANA (antes 42760, "Historical Price - Spot") NO tenía columnas
+     de TIR ni Modified Duration -- solo price/volume. Se elimina: los soberanos en
+     pesos (CER/Fija/DL/Duales) ahora se toman del MISMO dataset 41886 que ya usan
+     las ONs y los bonos HD, filtrando por "market segment" == "Sovereign". Ese
+     dataset SÍ trae irr/modified duration para todo el universo.
+
+  2) DATASET_REM (antes 5621) apuntaba a "Monthly GDP (IMAEP) - Banco Central del
+     Paraguay": el PBI mensual de Paraguay, sin ninguna relación con expectativas de
+     inflación de Argentina. Se reemplaza por el dataset 44033
+     ("Inflation Expectations (REM)", BCRA), que trae Variable/Referencia/Período/
+     Mediana y permite filtrar directamente "Próx. 12 meses" para la inflación
+     interanual esperada.
+
+  3) DATASET_FUTUROS (antes 5331) apuntaba al EMAE (INDEC) -- actividad económica,
+     no futuros de dólar. Se reemplaza por el dataset 5361 ("Dollar Futures -
+     Estimated Implied Curve", repositorio Matba Rofex), que trae Spot y la curva
+     interpolada a 30/60/.../330 días.
+
+  4) La clasificación CER/Fija/DL por REGEX sobre el ticker se reemplaza por el
+     campo "coupon structure" que ya viene provisto y clasificado en el dataset
+     (mucho más confiable). Se deja la posibilidad de reclasificar manualmente
+     por si el usuario quiere mover algún caso borde (ej. Duales).
+
+  5) Se agrega una sección explícita de CARRY TRADE: para cada bono CER/DL se
+     calcula el carry (en bps) entre el breakeven que pricea el mercado y la
+     expectativa de REM (para CER) o de la curva de futuros ROFEX (para DL),
+     interpolada a la duration de cada bono.
 
 Requisitos:
   pip install streamlit pandas numpy plotly scipy alphacast
 """
 
 import io
-import re
 from datetime import datetime
 
 import numpy as np
@@ -30,10 +50,10 @@ from scipy.optimize import curve_fit
 # Configuración general y tema visual
 # =====================================================================
 
-DEFAULT_DATASET_ID = 41886        # ONs / Bonos (curvas)
-DATASET_REM = 5621                # REM - BCRA (expectativas)
-DATASET_FUTUROS = 5331            # Futuros de dólar MATBA-ROFEX
-DATASET_RF_SOBERANA = 42760       # Renta fija soberana (CER / fija / DL) para breakevens
+DEFAULT_DATASET_ID = 41886        # ONs / Bonos / Soberanos (curvas) -- TODO el universo
+DATASET_REM = 44033                # REM - BCRA - Inflation Expectations (CORREGIDO)
+DATASET_FUTUROS = 5361             # Dollar Futures - Estimated Implied Curve (CORREGIDO)
+# DATASET_RF_SOBERANA eliminado: los soberanos en pesos salen del dataset principal.
 
 COLORS = {
     "primary": "#1f2a44",     # azul institucional
@@ -44,6 +64,7 @@ COLORS = {
     "cer": "#7c3aed",
     "fija": "#0891b2",
     "dl": "#ea580c",
+    "dual": "#a16207",
     "cheap": "#16a34a",
     "rich": "#dc2626",
     "grid": "rgba(120,130,150,0.18)",
@@ -70,8 +91,8 @@ def style_axes(fig: go.Figure, xtitle: str, ytitle: str) -> go.Figure:
     return fig
 
 
-def add_source_watermark(fig: go.Figure, fecha=None) -> go.Figure:
-    txt = "Fuente: Alphacast"
+def add_source_watermark(fig: go.Figure, fecha=None, fuente="Alphacast") -> go.Figure:
+    txt = f"Fuente: {fuente}"
     if fecha is not None:
         txt += f" · Datos al {pd.Timestamp(fecha).strftime('%d/%m/%Y')}"
     fig.add_annotation(text=txt, xref="paper", yref="paper", x=0, y=-0.16,
@@ -130,10 +151,17 @@ BONOS_GD = ["GD29", "GD30", "GD35", "GD38", "GD41", "GD46"]
 BONOS_AL = ["AL29", "AL30", "AL35", "AE38", "AL41", "AL46"]
 BOPREAL = ["BPOC7", "BPOC8", "BPOC9"]
 
-# Regex heurísticos para clasificar soberanos en pesos (editable desde la UI)
-REGEX_CER = r"^(TX|TZX|T2X|TC|PARP|DICP|CUAP|TZXD?)"
-REGEX_FIJA = r"^(S\d{2}|T\d{2}[A-Z]\d|TT[DJMS]\d|BNA|TO\d)"
-REGEX_DL = r"^(TV\d|TZV|D\d{2}[A-Z]\d)"
+# Clasificación de soberanos en pesos a partir de la columna "coupon structure"
+# que ya viene provista por el dataset (reemplaza los regex frágiles sobre ticker).
+COUPON_TO_CLASE = {
+    "ARS inflation-linked rate": "CER",
+    "ARS fixed rate": "Fija",
+    "Dollar-linked rate": "DL",
+    "Dual (CER Dollar-linked rate)": "Dual",
+    "Dual (Fixed or TAMAR rate)": "Dual",
+    "Dual (CER or TAMAR rate)": "Dual",
+    "ARS floating rate": "Badlar/Pase",
+}
 
 
 # =====================================================================
@@ -156,12 +184,15 @@ def download_dataset(api_key: str, dataset_id: int) -> pd.DataFrame:
 
 
 def normalize_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza el dataset principal (41886). A diferencia de la versión anterior,
+    CONSERVA 'market segment' y 'coupon structure': se necesitan para clasificar
+    soberanos en pesos (CER/Fija/DL/Dual) sin depender de regex sobre el ticker."""
     df = df.copy()
-    if "Market Segment" in df.columns:
-        df.drop(columns=["Market Segment"], inplace=True)
 
     ren = {"symbol": "Ticker", "irr": "TIR", "modified duration": "MD",
-           "convexity": "Convexidad", "parity": "Paridad", "residual value": "Valor Residual"}
+           "convexity": "Convexidad", "parity": "Paridad", "residual value": "Valor Residual",
+           "market segment": "Segmento", "coupon structure": "CouponStructure",
+           "issue currency": "IssueCcy", "trading currency": "TradingCcy"}
     df.rename(columns={k: v for k, v in ren.items() if k in df.columns}, inplace=True)
 
     if "Date" in df.columns:
@@ -171,7 +202,8 @@ def normalize_dataset(df: pd.DataFrame) -> pd.DataFrame:
     if "MD" in df.columns:
         df["MD"] = pd.to_numeric(df["MD"], errors="coerce")
 
-    wanted = ["Date", "Ticker", "Industry", "law", "TIR", "MD", "Convexidad", "Paridad", "Valor Residual"]
+    wanted = ["Date", "Ticker", "Industry", "law", "Segmento", "CouponStructure",
+              "IssueCcy", "TradingCcy", "TIR", "MD", "Convexidad", "Paridad", "Valor Residual"]
     df = df[[c for c in wanted if c in df.columns]].copy()
     for c in ["TIR", "MD", "Convexidad", "Paridad"]:
         if c in df.columns:
@@ -196,6 +228,16 @@ def build_ons_table(latest_df: pd.DataFrame, ons_df: pd.DataFrame) -> pd.DataFra
     o["Lamina_Minima"] = pd.to_numeric(o["Lamina_Minima"], errors="coerce")
     df = df[df["Ticker"].isin(o["Ticker"].dropna().unique())].copy()
     return df.merge(o[["Ticker", "Calificacion", "Lamina_Minima"]], on="Ticker", how="left")
+
+
+def classify_soberanos_pesos(df_norm: pd.DataFrame) -> pd.DataFrame:
+    """Filtra el dataset principal a soberanos ('Segmento'=='Sovereign') y clasifica
+    CER / Fija / DL / Dual a partir de 'CouponStructure' (dato provisto, no regex)."""
+    if "Segmento" not in df_norm.columns:
+        return pd.DataFrame()
+    d = df_norm[df_norm["Segmento"] == "Sovereign"].copy()
+    d["Clase"] = d["CouponStructure"].map(COUPON_TO_CLASE).fillna("Otro")
+    return d
 
 
 # =====================================================================
@@ -290,7 +332,6 @@ def plot_curve_pro(df: pd.DataFrame, title: str, fecha=None, group_col: str | No
             fig.add_trace(go.Scatter(x=dom, y=fitted, mode="lines",
                                      line=dict(dash="dash", width=2, color=COLORS["fit"]),
                                      name="Curva Nelson-Siegel"))
-            # Banda ±50 bps como referencia de valor relativo
             fig.add_trace(go.Scatter(x=np.concatenate([dom, dom[::-1]]),
                                      y=np.concatenate([fitted + 0.5, (fitted - 0.5)[::-1]]),
                                      fill="toself", fillcolor="rgba(100,116,139,0.10)",
@@ -317,7 +358,6 @@ def classify_bono(ticker: str) -> str:
 
 
 def spread_series(df_norm: pd.DataFrame) -> pd.DataFrame:
-    """Serie diaria de spread AL/AE - GD por 'Numero' (año de vencimiento)."""
     todos = BONOS_GD + BONOS_AL
     d = df_norm[df_norm["Ticker"].isin(todos)].dropna(subset=["TIR"]).copy()
     if d.empty or "Date" not in d.columns:
@@ -333,7 +373,6 @@ def spread_series(df_norm: pd.DataFrame) -> pd.DataFrame:
 
 
 def spread_stats(spreads: pd.DataFrame) -> pd.DataFrame:
-    """Último spread, promedio/desvío 252 ruedas y z-score por Numero."""
     if spreads.empty:
         return pd.DataFrame()
     rows = []
@@ -375,19 +414,8 @@ def plot_spread_history(spreads: pd.DataFrame):
 
 
 # =====================================================================
-# Breakevens (CER / DL vs tasa fija) + REM + Futuros
+# Breakevens (CER / DL vs tasa fija)
 # =====================================================================
-
-def classify_soberano(ticker: str, rx_cer: str, rx_fija: str, rx_dl: str) -> str:
-    t = str(ticker).upper().strip()
-    if re.match(rx_cer, t):
-        return "CER"
-    if re.match(rx_dl, t):
-        return "DL"
-    if re.match(rx_fija, t):
-        return "Fija"
-    return "Otro"
-
 
 def compute_breakevens(df_latest: pd.DataFrame, kind: str = "CER") -> pd.DataFrame:
     """
@@ -446,42 +474,124 @@ def plot_breakeven(df_be: pd.DataFrame, title: str, color: str, ref_value: float
     return fig
 
 
-def extract_rem_inflacion(df_rem: pd.DataFrame):
-    """
-    Intenta detectar en el REM la mediana de inflación esperada (próximos 12 meses
-    o interanual). Devuelve (valor, nombre_columna) o (None, None).
-    """
-    if df_rem is None or df_rem.empty:
+# =====================================================================
+# REM (dataset 44033) — inflación esperada a 12 meses
+# =====================================================================
+
+def get_rem_inflacion_12m(df_rem_raw: pd.DataFrame):
+    """Devuelve (mediana_%, fecha_relevamiento) para la inflación i.a. esperada a
+    'Próx. 12 meses' según el IPC nivel general del REM. None, None si no hay datos."""
+    needed = {"Variable", "Período", "Mediana", "Date"}
+    if df_rem_raw is None or df_rem_raw.empty or not needed.issubset(df_rem_raw.columns):
         return None, None
-    d = df_rem.copy()
+    d = df_rem_raw.copy()
+    d = d[(d["Variable"] == "IPC nivel general") & (d["Período"] == "Próx. 12 meses")]
+    if d.empty:
+        return None, None
+    d["Date"] = pd.to_datetime(d["Date"], errors="coerce")
+    d = d.dropna(subset=["Date"]).sort_values("Date")
+    if d.empty:
+        return None, None
+    last = d.iloc[-1]
+    val = pd.to_numeric(last["Mediana"], errors="coerce")
+    if pd.isna(val):
+        return None, None
+    return float(val), last["Date"]
+
+
+# =====================================================================
+# Futuros ROFEX (dataset 5361) — curva implícita de devaluación
+# =====================================================================
+
+def get_futuros_curva(df_fut_raw: pd.DataFrame):
+    """Devuelve (df_curva, spot, fecha). df_curva tiene columnas:
+    Días, Precio, Devaluación_periodo_%, Devaluación_anualizada_%."""
+    if df_fut_raw is None or df_fut_raw.empty or "Spot" not in df_fut_raw.columns:
+        return pd.DataFrame(), None, None
+    d = df_fut_raw.copy()
     if "Date" in d.columns:
         d["Date"] = pd.to_datetime(d["Date"], errors="coerce")
-        d = d.sort_values("Date")
-    cands = [c for c in d.columns if isinstance(c, str)
-             and re.search(r"inflaci", c, re.I)
-             and re.search(r"median", c, re.I)]
-    pref = [c for c in cands if re.search(r"12|interanual|i\.?a\.?|next 12", c, re.I)]
-    col = (pref or cands or [None])[0]
-    if col is None:
-        return None, None
-    serie = pd.to_numeric(d[col], errors="coerce").dropna()
-    if serie.empty:
-        return None, None
-    return float(serie.iloc[-1]), col
+        d = d.dropna(subset=["Date"]).sort_values("Date")
+    if d.empty:
+        return pd.DataFrame(), None, None
+    last = d.iloc[-1]
+    spot = pd.to_numeric(pd.Series([last.get("Spot")]), errors="coerce").iloc[0]
+    if pd.isna(spot) or spot <= 0:
+        return pd.DataFrame(), None, last.get("Date")
+
+    tenor_cols = [c for c in d.columns if isinstance(c, str) and c.strip().endswith(" days")
+                  and c.strip().split(" ")[0].isdigit()]
+    rows = []
+    for c in tenor_cols:
+        px = pd.to_numeric(pd.Series([last[c]]), errors="coerce").iloc[0]
+        if pd.notna(px) and px > 0:
+            days = int(c.strip().split(" ")[0])
+            deval_periodo = (px / spot - 1) * 100
+            deval_anual = ((px / spot) ** (365.0 / days) - 1) * 100
+            rows.append({"Días": days, "Precio": round(float(px), 2),
+                         "Devaluación_periodo_%": round(deval_periodo, 2),
+                         "Devaluación_anualizada_%": round(deval_anual, 2)})
+    df_curva = pd.DataFrame(rows).sort_values("Días").reset_index(drop=True)
+    return df_curva, float(spot), last.get("Date")
+
+
+def interp_futuros_annual(df_curva: pd.DataFrame, days: float):
+    """Interpola (o extrapola plano) la devaluación anualizada implícita a 'days'."""
+    if df_curva.empty:
+        return np.nan
+    dom = df_curva["Días"].values.astype(float)
+    y = df_curva["Devaluación_anualizada_%"].values.astype(float)
+    if days <= dom.max():
+        return float(np.interp(days, dom, y))
+    return float(y[-1])  # extrapolación plana más allá del último tenor cotizado
+
+
+# =====================================================================
+# Carry Trade: breakeven de mercado vs expectativa (REM / ROFEX)
+# =====================================================================
+
+def add_carry_trade(df_be: pd.DataFrame, kind: str, rem_value: float | None = None,
+                     fut_curve: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Agrega Expectativa_%anual, Carry_bps y Señal_Carry a un df de breakevens.
+    Carry_bps = (Breakeven_mercado - Expectativa) * 100.
+      * Carry > 0: el mercado pricea MÁS inflación/devaluación que la expectativa
+        (REM/ROFEX) → si la expectativa se cumple, la posición SIN cobertura
+        (tasa Fija) rinde de más (carry a favor de Fija).
+      * Carry < 0: el mercado pricea MENOS que la expectativa → la cobertura
+        (CER/DL) rinde de más si la expectativa se cumple (carry a favor de CER/DL).
+    """
+    d = df_be.copy()
+    if d.empty:
+        return d
+    if kind == "CER":
+        d["Expectativa_%anual"] = rem_value
+    else:
+        if fut_curve is None or fut_curve.empty:
+            d["Expectativa_%anual"] = np.nan
+        else:
+            d["Expectativa_%anual"] = d["MD"].apply(lambda md: interp_futuros_annual(fut_curve, md * 365))
+    d["Carry_bps"] = ((d["Breakeven_%anual"] - d["Expectativa_%anual"]) * 100).round(0)
+    d["Señal_Carry"] = np.select(
+        [d["Carry_bps"] >= 100, d["Carry_bps"] <= -100],
+        ["🟢 Carry a favor de Fija (mercado pricea de más)",
+         "🔵 Carry a favor de cobertura (mercado pricea de menos)"],
+        default="⚪ Neutral",
+    )
+    return d
 
 
 # =====================================================================
 # UI
 # =====================================================================
 
-st.set_page_config(page_title="Renta Fija PRO — Curvas, Spreads y Breakevens", layout="wide")
+st.set_page_config(page_title="Renta Fija PRO — Curvas, Spreads, Breakevens y Carry Trade", layout="wide")
 
 st.markdown(
     f"""
     <div style="padding:14px 20px;border-radius:12px;
          background:linear-gradient(90deg,{COLORS['primary']},#31456e);color:white;">
       <span style="font-size:1.45rem;font-weight:700;">📊 Renta Fija Argentina — Panel PRO</span><br>
-      <span style="opacity:.85;">Curvas ONs y soberanos · valor relativo · spreads por legislación · breakevens vs REM y ROFEX</span>
+      <span style="opacity:.85;">Curvas ONs y soberanos · valor relativo · spreads por legislación · breakevens y carry trade vs REM y ROFEX</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -491,7 +601,12 @@ st.caption("Herramienta de análisis. No constituye recomendación de inversión
 with st.sidebar:
     st.header("⚙️ Configuración")
     api_key = st.text_input("Alphacast API Key", value="", type="password")
-    dataset_id = st.number_input("Dataset curvas (ONs/Bonos)", value=int(DEFAULT_DATASET_ID), step=1)
+    dataset_id = st.number_input(
+        "Dataset principal (ONs, Bonos HD y Soberanos en pesos)",
+        value=int(DEFAULT_DATASET_ID), step=1,
+        help="Un único dataset cubre todo el universo: 'market segment' distingue "
+             "Corporate/Sovereign y 'coupon structure' distingue CER/Fija/DL/Dual.",
+    )
 
     st.divider()
     st.subheader("Filtros de ONs")
@@ -500,23 +615,22 @@ with st.sidebar:
     rating = st.text_input("Calificación exacta (vacío = todas)", value="AAA(arg)")
 
     st.divider()
-    st.subheader("Breakevens")
-    ds_soberanos = st.number_input("Dataset RF soberana (pesos)", value=int(DATASET_RF_SOBERANA), step=1)
+    st.subheader("Breakevens y Carry Trade")
     ds_rem = st.number_input("Dataset REM (BCRA)", value=int(DATASET_REM), step=1)
-    ds_fut = st.number_input("Dataset Futuros dólar", value=int(DATASET_FUTUROS), step=1)
+    ds_fut = st.number_input("Dataset Futuros ROFEX", value=int(DATASET_FUTUROS), step=1)
 
 if not api_key.strip():
     st.warning("Ingresá tu Alphacast API Key para descargar los datasets.")
     st.stop()
 
-with st.spinner("Descargando dataset de curvas..."):
+with st.spinner("Descargando dataset principal..."):
     raw = download_dataset(api_key.strip(), int(dataset_id))
 
 df_norm = normalize_dataset(raw)
 latest_df, most_recent_date = latest_snapshot(df_norm)
 
 tab_ons, tab_bonos, tab_be, tab_insights = st.tabs(
-    ["🏢 ONs", "💵 Bonos Hard Dollar", "⚖️ Breakevens (CER · DL · REM · ROFEX)", "🎯 Insights"]
+    ["🏢 ONs", "💵 Bonos Hard Dollar", "⚖️ Breakevens & Carry Trade", "🎯 Insights"]
 )
 
 # ---------------------------------------------------------------------
@@ -616,7 +730,6 @@ with tab_bonos:
         if fig_b is not None:
             st.plotly_chart(fig_b, use_container_width=True)
 
-        # Ratio TIR/MD como proxy de carry por unidad de riesgo tasa
         lb["TIR/MD"] = (lb["TIR"] / lb["MD"]).round(2)
         st.subheader("Snapshot (fecha más reciente)")
         st.dataframe(lb.sort_values(["Grupo", "Ticker"]), use_container_width=True, height=320)
@@ -636,72 +749,86 @@ with tab_bonos:
         st.info("No hay pares AL/GD suficientes para calcular spreads históricos.")
 
 # ---------------------------------------------------------------------
-# TAB 3 — Breakevens
+# TAB 3 — Breakevens & Carry Trade
 # ---------------------------------------------------------------------
 with tab_be:
     st.markdown(
         "El **breakeven** es la inflación (o devaluación) anual que iguala el rendimiento de un bono CER "
         "(o Dollar Linked) con el de un bono a **tasa fija** de igual duration: "
         "`BE = (1 + TIR_fija) / (1 + TIR_real) − 1`. "
-        "Si esperás inflación **mayor** al breakeven, conviene CER; si esperás **menor**, conviene tasa fija. "
-        "Análogo para DL con la devaluación."
+        "El **carry trade** compara ese breakeven de mercado contra una *expectativa externa* "
+        "(REM del BCRA para inflación, curva de futuros ROFEX para devaluación): "
+        "si el mercado pricea más de lo que se espera, la posición sin cobertura (tasa fija) "
+        "tiene carry a favor; si pricea menos, la cobertura (CER/DL) es la que tiene carry a favor."
     )
 
-    try:
-        with st.spinner("Descargando renta fija soberana en pesos..."):
-            raw_sob = download_dataset(api_key.strip(), int(ds_soberanos))
-        df_sob = normalize_dataset(raw_sob)
-        latest_sob, fecha_sob = latest_snapshot(df_sob)
-    except Exception as e:
-        latest_sob, fecha_sob = pd.DataFrame(), None
-        st.error(f"No se pudo descargar el dataset {ds_soberanos}: {e}")
+    latest_sob = classify_soberanos_pesos(latest_df)
 
-    if not latest_sob.empty and {"Ticker", "TIR", "MD"}.issubset(latest_sob.columns):
-        with st.expander("Ajustar clasificación CER / Fija / DL (regex y selección manual)"):
-            rx_cer = st.text_input("Regex CER", value=REGEX_CER)
-            rx_fija = st.text_input("Regex Tasa fija", value=REGEX_FIJA)
-            rx_dl = st.text_input("Regex Dollar Linked", value=REGEX_DL)
+    if not latest_sob.empty and {"Ticker", "TIR", "MD", "Clase"}.issubset(latest_sob.columns):
+        counts = latest_sob["Clase"].value_counts()
+        st.caption(
+            f"Detectados (vía coupon structure) → CER: {counts.get('CER', 0)} · "
+            f"Fija: {counts.get('Fija', 0)} · DL: {counts.get('DL', 0)} · "
+            f"Dual: {counts.get('Dual', 0)} · Badlar/Pase: {counts.get('Badlar/Pase', 0)} · "
+            f"Otro: {counts.get('Otro', 0)}"
+        )
 
-        latest_sob["Clase"] = latest_sob["Ticker"].apply(lambda t: classify_soberano(t, rx_cer, rx_fija, rx_dl))
-
-        with st.expander("Revisar / corregir universo detectado"):
+        with st.expander("Revisar / reclasificar manualmente (por si algún Dual/borde no aplica)"):
             for k in ["CER", "Fija", "DL"]:
                 auto = sorted(latest_sob.loc[latest_sob["Clase"] == k, "Ticker"].astype(str).unique())
                 pick = st.multiselect(f"Bonos {k}", options=sorted(latest_sob["Ticker"].astype(str).unique()),
                                       default=auto, key=f"pick_{k}")
                 latest_sob.loc[latest_sob["Ticker"].astype(str).isin(pick), "Clase"] = k
 
-        counts = latest_sob["Clase"].value_counts()
-        st.caption(f"Detectados → CER: {counts.get('CER', 0)} · Fija: {counts.get('Fija', 0)} · DL: {counts.get('DL', 0)}")
-
         # --- REM ---
-        rem_val, rem_col = None, None
+        rem_val, rem_fecha = None, None
         try:
-            with st.spinner("Descargando REM (BCRA)..."):
+            with st.spinner("Descargando REM (BCRA) — Inflation Expectations..."):
                 raw_rem = download_dataset(api_key.strip(), int(ds_rem))
-            rem_val, rem_col = extract_rem_inflacion(raw_rem)
-            with st.expander("Ver REM crudo / elegir otra columna"):
-                st.dataframe(raw_rem.tail(15), use_container_width=True)
-                manual_col = st.selectbox("Columna de expectativa a usar",
-                                          options=["(auto)"] + [c for c in raw_rem.columns if c != "Date"])
-                if manual_col != "(auto)":
-                    s = pd.to_numeric(raw_rem[manual_col], errors="coerce").dropna()
-                    if not s.empty:
-                        rem_val, rem_col = float(s.iloc[-1]), manual_col
+            rem_val, rem_fecha = get_rem_inflacion_12m(raw_rem)
+            with st.expander("Ver REM crudo"):
+                st.dataframe(raw_rem.tail(20), use_container_width=True)
+                if rem_val is not None:
+                    st.caption(f"Inflación i.a. esperada 'Próx. 12 meses' (IPC nivel general, mediana): "
+                               f"**{rem_val:.1f}%** — relevamiento del {pd.Timestamp(rem_fecha).strftime('%m/%Y')}")
+                else:
+                    st.warning("No se encontró la combinación Variable='IPC nivel general' / "
+                               "Período='Próx. 12 meses' en este dataset.")
         except Exception as e:
-            st.warning(f"No se pudo procesar el REM (dataset {ds_rem}): {e}")
+            st.warning(f"No se pudo descargar/procesar el REM (dataset {ds_rem}): {e}")
+
+        # --- Futuros ROFEX ---
+        fut_curve, fut_spot, fut_fecha = pd.DataFrame(), None, None
+        try:
+            with st.spinner("Descargando curva de futuros ROFEX..."):
+                raw_fut = download_dataset(api_key.strip(), int(ds_fut))
+            fut_curve, fut_spot, fut_fecha = get_futuros_curva(raw_fut)
+            with st.expander("Ver curva de futuros ROFEX (implícita, interpolada por plazo)"):
+                if not fut_curve.empty:
+                    st.dataframe(fut_curve, use_container_width=True)
+                    st.caption(f"Spot de referencia: **{fut_spot:.2f}** — "
+                               f"dato al {pd.Timestamp(fut_fecha).strftime('%d/%m/%Y') if fut_fecha is not None else '—'}")
+                else:
+                    st.warning("No se pudo construir la curva de futuros (revisar columnas 'Spot' / 'N days').")
+        except Exception as e:
+            st.warning(f"No se pudo descargar/procesar los futuros ROFEX (dataset {ds_fut}): {e}")
 
         col_a, col_b = st.columns(2)
 
         with col_a:
-            st.subheader("🔥 Breakeven de inflación (CER vs fija)")
+            st.subheader("🔥 Inflación: CER vs Fija")
             be_cer = compute_breakevens(latest_sob, kind="CER")
             if not be_cer.empty:
                 fig = plot_breakeven(be_cer, "Inflación breakeven implícita por plazo", COLORS["cer"],
                                      ref_value=rem_val,
-                                     ref_label=f"REM: {rem_val:.1f}%" if rem_val is not None else None)
+                                     ref_label=f"REM (12m): {rem_val:.1f}%" if rem_val is not None else None)
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(be_cer, use_container_width=True, height=260)
+
+                be_cer_carry = add_carry_trade(be_cer, "CER", rem_value=rem_val)
+                cols_show = [c for c in ["Ticker", "MD", "TIR_Real", "TIR_Fija_Interp", "Breakeven_%anual",
+                                         "Expectativa_%anual", "Carry_bps", "Señal_Carry"] if c in be_cer_carry.columns]
+                st.dataframe(be_cer_carry[cols_show], use_container_width=True, height=280)
+
                 if rem_val is not None:
                     corto = be_cer[be_cer["MD"] <= 1.5]
                     if not corto.empty:
@@ -710,11 +837,11 @@ with tab_be:
                         if gap > 3:
                             st.success(f"**Insight:** el mercado descuenta {be_prom:.1f}% de inflación en el tramo corto, "
                                        f"{gap:+.1f} pp por **encima** del REM ({rem_val:.1f}%). Si el REM acierta, "
-                                       f"la **tasa fija** ofrece mejor retorno esperado que CER en ese tramo.")
+                                       f"la **tasa fija** ofrece mejor retorno esperado que CER en ese tramo (carry a favor de Fija).")
                         elif gap < -3:
                             st.success(f"**Insight:** breakeven corto ({be_prom:.1f}%) {abs(gap):.1f} pp por **debajo** del REM "
                                        f"({rem_val:.1f}%). El CER luce **barato**: si la inflación converge al REM, "
-                                       f"CER supera a tasa fija.")
+                                       f"CER supera a tasa fija (carry a favor de CER).")
                         else:
                             st.info(f"Breakeven corto ({be_prom:.1f}%) alineado con el REM ({rem_val:.1f}%): "
                                     f"el mercado y los analistas están pricing similar. Decisión por perfil de riesgo/liquidez.")
@@ -722,63 +849,44 @@ with tab_be:
                 st.info("No hay suficientes bonos CER y tasa fija clasificados para calcular breakevens.")
 
         with col_b:
-            st.subheader("💱 Breakeven de devaluación (DL vs fija)")
+            st.subheader("💱 Devaluación: DL vs Fija")
             be_dl = compute_breakevens(latest_sob, kind="DL")
-
-            # Futuros ROFEX como referencia cruzada
-            fut_ref = None
-            try:
-                with st.spinner("Descargando futuros de dólar..."):
-                    raw_fut = download_dataset(api_key.strip(), int(ds_fut))
-                with st.expander("Futuros MATBA-ROFEX (crudo) + devaluación implícita"):
-                    st.dataframe(raw_fut.tail(20), use_container_width=True)
-                    spot = st.number_input("Spot de referencia (A3500 / mayorista)", value=0.0, step=1.0,
-                                           help="Ingresá el spot para calcular devaluación implícita de cada posición.")
-                    num_cols = [c for c in raw_fut.columns
-                                if c != "Date" and pd.to_numeric(raw_fut[c], errors="coerce").notna().any()]
-                    fut_cols = st.multiselect("Columnas de posiciones de futuros", options=num_cols)
-                    if spot > 0 and fut_cols:
-                        last = raw_fut.sort_values("Date").iloc[-1] if "Date" in raw_fut.columns else raw_fut.iloc[-1]
-                        rows = []
-                        for c in fut_cols:
-                            px = pd.to_numeric(pd.Series([last[c]]), errors="coerce").iloc[0]
-                            if pd.notna(px):
-                                rows.append({"Posición": c, "Precio": round(float(px), 2),
-                                             "Devaluación_directa_%": round((float(px) / spot - 1) * 100, 2)})
-                        if rows:
-                            df_fut = pd.DataFrame(rows)
-                            st.dataframe(df_fut, use_container_width=True)
-                            fut_ref = df_fut["Devaluación_directa_%"].iloc[-1]
-            except Exception as e:
-                st.warning(f"No se pudo procesar futuros (dataset {ds_fut}): {e}")
-
             if not be_dl.empty:
+                # Referencia puntual: devaluación anualizada implícita ROFEX en la MD promedio de los DL
+                ref_days = float(be_dl["MD"].mean() * 365) if not be_dl.empty else None
+                fut_ref = interp_futuros_annual(fut_curve, ref_days) if ref_days is not None else np.nan
+                fut_ref = None if pd.isna(fut_ref) else fut_ref
+
                 fig = plot_breakeven(be_dl, "Devaluación breakeven implícita por plazo", COLORS["dl"],
                                      ref_value=fut_ref,
-                                     ref_label=f"ROFEX (última posición): {fut_ref:.1f}%" if fut_ref is not None else None)
+                                     ref_label=f"ROFEX (anualizada, MD prom.): {fut_ref:.1f}%" if fut_ref is not None else None)
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(be_dl, use_container_width=True, height=260)
-                st.caption("Si el breakeven de devaluación de la curva DL difiere mucho de lo que descuenta ROFEX "
-                           "para plazos comparables, hay una inconsistencia explotable entre ambos mercados "
-                           "(sujeta a costos de rolleo, garantías y liquidez).")
+
+                be_dl_carry = add_carry_trade(be_dl, "DL", fut_curve=fut_curve)
+                cols_show = [c for c in ["Ticker", "MD", "TIR_DL", "TIR_Fija_Interp", "Breakeven_%anual",
+                                         "Expectativa_%anual", "Carry_bps", "Señal_Carry"] if c in be_dl_carry.columns]
+                st.dataframe(be_dl_carry[cols_show], use_container_width=True, height=280)
+                st.caption("La 'Expectativa_%anual' de cada bono DL interpola la curva de futuros ROFEX a la "
+                           "duration de ESE bono (MD × 365 días), en vez de usar un único punto fijo. Más allá del "
+                           "último tenor cotizado por ROFEX se extrapola en forma plana (revisar la curva cruda arriba).")
             else:
                 st.info("No hay suficientes bonos DL y tasa fija clasificados para calcular breakevens.")
 
         # Curvas en pesos superpuestas
-        st.subheader("Curvas en pesos: Fija vs CER vs DL")
-        d3 = latest_sob[latest_sob["Clase"].isin(["CER", "Fija", "DL"])].copy()
+        st.subheader("Curvas en pesos: Fija vs CER vs DL vs Dual")
+        d3 = latest_sob[latest_sob["Clase"].isin(["CER", "Fija", "DL", "Dual"])].copy()
         if not d3.empty:
-            fig3, _ = plot_curve_pro(d3, "TIR vs MD por clase (fit NS por grupo)", fecha=fecha_sob,
+            fig3, _ = plot_curve_pro(d3, "TIR vs MD por clase (fit NS por grupo)", fecha=most_recent_date,
                                      group_col="Clase",
-                                     group_colors={"CER": COLORS["cer"], "Fija": COLORS["fija"], "DL": COLORS["dl"]},
+                                     group_colors={"CER": COLORS["cer"], "Fija": COLORS["fija"],
+                                                   "DL": COLORS["dl"], "Dual": COLORS["dual"]},
                                      fit_per_group=True)
             if fig3 is not None:
                 st.plotly_chart(fig3, use_container_width=True)
             st.caption("Ojo: la curva CER está en tasa **real** y la fija en tasa **nominal** — la brecha vertical "
                        "entre ambas es, justamente, la inflación breakeven.")
     else:
-        st.info("El dataset de soberanos no tiene la estructura esperada (Ticker/TIR/MD). "
-                "Revisá el ID o los nombres de columnas.")
+        st.info("No se encontraron soberanos en pesos en el dataset principal (revisar 'market segment' == 'Sovereign').")
 
 # ---------------------------------------------------------------------
 # TAB 4 — Insights automáticos
@@ -787,7 +895,6 @@ with tab_insights:
     st.subheader("🎯 Resumen ejecutivo para el asesor")
     bullets = []
 
-    # Forma de la curva HD (usa fit global de GD)
     lb_all = latest_df[latest_df["Ticker"].isin(BONOS_GD)].dropna(subset=["MD", "TIR"])
     if len(lb_all) >= 3:
         corto = lb_all.nsmallest(2, "MD")["TIR"].mean()
@@ -798,7 +905,6 @@ with tab_insights:
         bullets.append(f"**Curva GD {forma}.** Tramo corto ≈ {corto:.1f}%, tramo largo ≈ {largo:.1f}% "
                        f"(pendiente {pend:+.1f} pp).")
 
-    # Spread ley
     try:
         stats_i = spread_stats(spread_series(df_norm))
         if not stats_i.empty:
@@ -813,7 +919,6 @@ with tab_insights:
     except Exception:
         pass
 
-    # ONs cheap/rich
     try:
         if "df_ons_f" in dir() and isinstance(df_ons_f, pd.DataFrame) and "Residuo_bps" in df_ons_f.columns \
                 and df_ons_f["Residuo_bps"].notna().any():
@@ -821,6 +926,18 @@ with tab_insights:
             names = ", ".join(f"{r.Ticker} (+{r.Residuo_bps:.0f} bps)" for r in top.itertuples())
             bullets.append(f"**ONs con mayor exceso de TIR vs curva:** {names}. "
                            f"Chequear liquidez y riesgo emisor antes de armar posición.")
+    except Exception:
+        pass
+
+    # Insight de Carry Trade (nuevo)
+    try:
+        latest_sob_i = classify_soberanos_pesos(latest_df)
+        if not latest_sob_i.empty:
+            be_cer_i = compute_breakevens(latest_sob_i, kind="CER")
+            if not be_cer_i.empty:
+                bullets.append(f"**Carry trade CER vs Fija:** breakeven promedio de mercado "
+                               f"{be_cer_i['Breakeven_%anual'].mean():.1f}% anual. Compará contra el REM "
+                               f"en la pestaña de Breakevens para ver de qué lado está el carry en cada plazo.")
     except Exception:
         pass
 
@@ -838,9 +955,10 @@ with tab_insights:
           suele reflejar liquidez, lámina mínima, o riesgo idiosincrático. Es un **filtro**, no una orden.
         - *Spread AL−GD*: mide el premio que paga la ley local. Su z-score histórico indica si ese premio
           está caro o barato **en términos relativos**, no si el país mejora o empeora.
-        - *Breakeven CER*: es la inflación que "empata" fija vs CER. Compararlo contra el REM te dice
-          qué está pricing el mercado vs qué esperan los analistas — el gap es la oportunidad (o el riesgo).
-        - *Breakeven DL vs ROFEX*: dos mercados que descuentan devaluación; cuando divergen para el mismo
-          plazo, uno de los dos está "equivocado" (o hay fricciones de acceso/garantías que lo explican).
+        - *Breakeven CER*: es la inflación que "empata" fija vs CER.
+        - *Carry trade*: compara ese breakeven de mercado contra una expectativa externa (REM o ROFEX).
+          Carry positivo (mercado pricea de más) favorece quedarse en tasa fija sin cobertura; carry negativo
+          favorece la cobertura (CER/DL). El carry en bps es una medida de la **oportunidad**, no una garantía:
+          la expectativa externa (REM/analistas, o el propio mercado de futuros) puede estar equivocada.
         """
     )
