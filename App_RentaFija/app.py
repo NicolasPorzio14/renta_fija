@@ -542,46 +542,114 @@ def get_rem_inflacion_12m(df_rem_raw: pd.DataFrame):
 # =====================================================================
 
 def get_futuros_curva(df_fut_raw: pd.DataFrame):
-    """Devuelve (df_curva, spot, fecha). df_curva tiene columnas:
-    Días, Precio, Devaluación_periodo_%, Devaluación_anualizada_%."""
+    """Devuelve (df_curva, spot, fecha, diag).
+
+    El dataset 5361 ('Estimated Implied Curve') tiene columnas Spot y '<N> days'.
+    OJO: no siempre los tenors están en la misma escala que el Spot (a veces son
+    precio $/USD, a veces vienen como índice). Esta versión:
+      - toma la ÚLTIMA fila con Spot válido,
+      - por cada tenor usa el último valor NO NULO y > 0 (no fuerza la última fila,
+        que suele tener tenors largos sin cotizar → causaba el bug de -100%),
+      - valida que el precio del futuro sea plausible vs spot (0.8x a 5x): si no,
+        descarta ese tenor en vez de generar devaluaciones imposibles,
+      - devuelve un dict 'diag' para auditoría.
+    df_curva: Días, Precio, Deval_periodo_%, Deval_anualizada_%.
+    """
+    diag = {"ok": False, "motivo": ""}
     if df_fut_raw is None or df_fut_raw.empty or "Spot" not in df_fut_raw.columns:
-        return pd.DataFrame(), None, None
+        diag["motivo"] = "sin columna Spot"
+        return pd.DataFrame(), None, None, diag
     d = df_fut_raw.copy()
     if "Date" in d.columns:
         d["Date"] = pd.to_datetime(d["Date"], errors="coerce")
         d = d.dropna(subset=["Date"]).sort_values("Date")
     if d.empty:
-        return pd.DataFrame(), None, None
-    last = d.iloc[-1]
-    spot = pd.to_numeric(pd.Series([last.get("Spot")]), errors="coerce").iloc[0]
-    if pd.isna(spot) or spot <= 0:
-        return pd.DataFrame(), None, last.get("Date")
+        diag["motivo"] = "sin filas con fecha"
+        return pd.DataFrame(), None, None, diag
 
-    tenor_cols = [c for c in d.columns if isinstance(c, str) and c.strip().endswith(" days")
-                  and c.strip().split(" ")[0].isdigit()]
+    # Último spot válido
+    spot_series = pd.to_numeric(d["Spot"], errors="coerce").dropna()
+    if spot_series.empty or spot_series.iloc[-1] <= 0:
+        diag["motivo"] = "spot inválido"
+        return pd.DataFrame(), None, d["Date"].iloc[-1] if "Date" in d else None, diag
+    spot = float(spot_series.iloc[-1])
+    fecha = d.loc[spot_series.index[-1], "Date"] if "Date" in d.columns else None
+
+    # Tenors "<N> days" SIN sufijos derivados (change / running_av / mom)
+    tenor_cols = []
+    for c in d.columns:
+        if not isinstance(c, str):
+            continue
+        cs = c.strip()
+        if cs.lower().endswith(" days") and cs.split(" ")[0].isdigit():
+            tenor_cols.append(c)
+
     rows = []
     for c in tenor_cols:
-        px = pd.to_numeric(pd.Series([last[c]]), errors="coerce").iloc[0]
-        if pd.notna(px) and px > 0:
-            days = int(c.strip().split(" ")[0])
-            deval_periodo = (px / spot - 1) * 100
-            deval_anual = ((px / spot) ** (365.0 / days) - 1) * 100
-            rows.append({"Días": days, "Precio": round(float(px), 2),
-                         "Devaluación_periodo_%": round(deval_periodo, 2),
-                         "Devaluación_anualizada_%": round(deval_anual, 2)})
+        serie = pd.to_numeric(d[c], errors="coerce").dropna()
+        serie = serie[serie > 0]
+        if serie.empty:
+            continue
+        px = float(serie.iloc[-1])
+        days = int(c.strip().split(" ")[0])
+        ratio = px / spot
+        # Validación de plausibilidad: un futuro de dólar cotiza por encima del spot
+        # pero no 5x en <1 año. Si el ratio es absurdo, el tenor está en otra escala.
+        if not (0.8 <= ratio <= 5.0):
+            continue
+        deval_periodo = (ratio - 1) * 100
+        deval_anual = (ratio ** (365.0 / days) - 1) * 100
+        rows.append({"Días": days, "Precio": round(px, 2),
+                     "Deval_periodo_%": round(deval_periodo, 2),
+                     "Deval_anualizada_%": round(deval_anual, 2)})
+
     df_curva = pd.DataFrame(rows).sort_values("Días").reset_index(drop=True)
-    return df_curva, float(spot), last.get("Date")
+    diag["ok"] = not df_curva.empty
+    diag["tenors_validos"] = len(df_curva)
+    diag["tenors_totales"] = len(tenor_cols)
+    if df_curva.empty:
+        diag["motivo"] = ("ningún tenor pasó la validación de plausibilidad vs spot "
+                          "(precios en escala distinta al spot) — se usará devaluación implícita de los bonos DL")
+    return df_curva, spot, fecha, diag
+
+
+def deval_implicita_desde_bonos(fija_df: pd.DataFrame, dl_df: pd.DataFrame,
+                                params_fija=None, horizon_days: float = 365) -> float | None:
+    """Fallback robusto: devaluación anualizada implícita estimada desde los propios
+    bonos, como la que iguala fija vs DL a ~1 año de duration. Es el breakeven de
+    devaluación de mercado (BE = (1+TIR_fija)/(1+TIR_DL)-1) evaluado en la duration
+    más cercana a 'horizon_days'. No depende del dataset de futuros."""
+    if fija_df is None or dl_df is None or fija_df.empty or dl_df.empty:
+        return None
+    target_md = horizon_days / 365.0
+    dl_sorted = dl_df.dropna(subset=["MD", "TIR"]).copy()
+    if dl_sorted.empty:
+        return None
+    dl_sorted["dist"] = (dl_sorted["MD"] - target_md).abs()
+    r = dl_sorted.sort_values("dist").iloc[0]
+    md = float(r["MD"]); tir_dl = float(r["TIR"])
+
+    lo, hi = fija_df["MD"].min(), fija_df["MD"].max()
+    if params_fija is not None and lo <= md <= hi:
+        tir_fija = float(nelson_siegel(np.array([md]), *params_fija)[0])
+    else:
+        f = fija_df.sort_values("MD")
+        tir_fija = float(np.interp(md, f["MD"], f["TIR"]))
+    be = ((1 + tir_fija / 100) / (1 + tir_dl / 100) - 1) * 100
+    return round(be, 1)
 
 
 def interp_futuros_annual(df_curva: pd.DataFrame, days: float):
     """Interpola (o extrapola plano) la devaluación anualizada implícita a 'days'."""
-    if df_curva.empty:
+    if df_curva is None or df_curva.empty:
         return np.nan
     dom = df_curva["Días"].values.astype(float)
-    y = df_curva["Devaluación_anualizada_%"].values.astype(float)
+    y = df_curva["Deval_anualizada_%"].values.astype(float)
+    if len(dom) == 1:
+        return float(y[0])
     if days <= dom.max():
         return float(np.interp(days, dom, y))
-    return float(y[-1])  # extrapolación plana más allá del último tenor cotizado
+    return float(y[-1])
 
 
 # =====================================================================
@@ -655,8 +723,79 @@ def carry_scenario(df_target: pd.DataFrame, fija: pd.DataFrame, kind: str,
 
 
 # =====================================================================
-# UI
+# Sensibilidad: mapa de calor excess return por instrumento y escenario
 # =====================================================================
+
+def sensitivity_matrix(bono_tir: float, tir_fija_interp: float, escenarios: np.ndarray) -> np.ndarray:
+    """Vector de excess return (pp) de una cobertura vs su fija comparable, para
+    una grilla de escenarios de indexación (inflación o devaluación).
+      excess(e) = [(1+TIR_cob)*(1+e) - 1] - TIR_fija   (todo en %)
+    """
+    ret_cob = ((1 + bono_tir / 100) * (1 + escenarios / 100) - 1) * 100
+    return ret_cob - tir_fija_interp
+
+
+def build_heatmap(df_carry: pd.DataFrame, kind: str, esc_min: float, esc_max: float,
+                  n: int = 25, escenario_marker: float | None = None):
+    """Heatmap: filas = instrumentos (ordenados por MD), columnas = escenario de
+    inflación/devaluación anual, color = excess return (pp) de la cobertura vs fija.
+    Verde = conviene la cobertura; rojo = conviene la fija. La línea vertical marca
+    el escenario elegido; la 'X' por fila marca el breakeven de cada bono."""
+    if df_carry.empty or "TIR_" + ("Real" if kind == "CER" else "DL") not in df_carry.columns:
+        return None
+    col_tir = "TIR_Real" if kind == "CER" else "TIR_DL"
+    d = df_carry.dropna(subset=[col_tir, "TIR_Fija_interp", "MD"]).sort_values("MD")
+    if d.empty:
+        return None
+
+    escenarios = np.linspace(esc_min, esc_max, n)
+    z = np.array([sensitivity_matrix(float(r[col_tir]), float(r["TIR_Fija_interp"]), escenarios)
+                  for _, r in d.iterrows()])
+    y_labels = [f"{r['Ticker']} · MD {r['MD']:.2f}" for _, r in d.iterrows()]
+
+    zmax = np.nanmax(np.abs(z)) if z.size else 1
+    fig = go.Figure(data=go.Heatmap(
+        z=z, x=escenarios, y=y_labels,
+        colorscale=[[0, "#b91c1c"], [0.5, "#f8fafc"], [1, "#15803d"]],
+        zmid=0, zmin=-zmax, zmax=zmax,
+        colorbar=dict(title="Excess<br>(pp)", thickness=14),
+        hovertemplate=("<b>%{y}</b><br>Escenario: %{x:.1f}%<br>"
+                       "Excess cobertura vs fija: %{z:+.1f} pp<extra></extra>"),
+    ))
+
+    # marca de breakeven por fila (donde excess cruza 0)
+    be_x = d["Breakeven_%anual"].values.astype(float)
+    fig.add_trace(go.Scatter(
+        x=be_x, y=y_labels, mode="markers",
+        marker=dict(symbol="x", size=9, color="#0f172a", line=dict(width=1, color="white")),
+        name="Breakeven", hovertemplate="Breakeven: %{x:.1f}%<extra></extra>",
+    ))
+
+    if escenario_marker is not None:
+        fig.add_vline(x=escenario_marker, line_dash="dash", line_color=COLORS["accent"],
+                      annotation_text=f"Escenario: {escenario_marker:.1f}%",
+                      annotation_font_color=COLORS["accent"])
+
+    etiqueta = "inflación" if kind == "CER" else "devaluación"
+    fig.update_layout(title=f"Sensibilidad: excess return de {kind} vs Fija según {etiqueta} anual",
+                      height=max(300, 44 * len(y_labels) + 140), **PLOTLY_LAYOUT)
+    style_axes(fig, f"{etiqueta.capitalize()} anual asumida (%)", "")
+    fig.update_yaxes(autorange="reversed")
+    add_source_watermark(fig)
+    return fig
+
+
+def drop_short_outliers(df: pd.DataFrame, min_md: float = 0.15,
+                        tir_abs_max: float = 60.0) -> pd.DataFrame:
+    """Descarta instrumentos ultra-cortos con TIR anualizada explosiva (p.ej. una
+    LECER a días de vencer con tasa real muy negativa/positiva) que distorsionan el
+    fit de curva y el breakeven del tramo corto. No los borra del universo global,
+    solo del set que alimenta la curva de tasa fija y los breakevens."""
+    if df.empty:
+        return df
+    out = df.copy()
+    mask = (out["MD"] >= min_md) & (out["TIR"].abs() <= tir_abs_max)
+    return out[mask].reset_index(drop=True)
 
 st.set_page_config(page_title="Renta Fija PRO — Curvas, Spreads, Breakevens y Carry Trade", layout="wide")
 
@@ -841,9 +980,9 @@ with tab_be:
         st.info("No se encontraron soberanos en pesos operables en el dataset (revisar filtros/segmento).")
         st.stop()
 
-    fija_df = latest_sob[latest_sob["Clase"] == "Fija"].dropna(subset=["MD", "TIR"])
-    cer_df = latest_sob[latest_sob["Clase"] == "CER"].dropna(subset=["MD", "TIR"]).rename(columns={"TIR": "TIR"})
-    dl_df = latest_sob[latest_sob["Clase"] == "DL"].dropna(subset=["MD", "TIR"])
+    fija_df = drop_short_outliers(latest_sob[latest_sob["Clase"] == "Fija"].dropna(subset=["MD", "TIR"]))
+    cer_df = drop_short_outliers(latest_sob[latest_sob["Clase"] == "CER"].dropna(subset=["MD", "TIR"]))
+    dl_df = drop_short_outliers(latest_sob[latest_sob["Clase"] == "DL"].dropna(subset=["MD", "TIR"]))
     params_fija, _ = fit_ns(fija_df["MD"], fija_df["TIR"]) if len(fija_df) >= 5 else (None, None)
 
     counts = latest_sob["Clase"].value_counts()
@@ -866,17 +1005,23 @@ with tab_be:
     except Exception as e:
         st.warning(f"No se pudo procesar el REM (dataset {ds_rem}): {e}")
 
-    fut_curve, fut_spot, fut_fecha = pd.DataFrame(), None, None
+    fut_curve, fut_spot, fut_fecha, fut_diag = pd.DataFrame(), None, None, {"ok": False, "motivo": "no descargado"}
     try:
         with st.spinner("Futuros ROFEX…"):
             raw_fut = download_dataset(api_key.strip(), int(ds_fut))
-        fut_curve, fut_spot, fut_fecha = get_futuros_curva(raw_fut)
+        fut_curve, fut_spot, fut_fecha, fut_diag = get_futuros_curva(raw_fut)
     except Exception as e:
         st.warning(f"No se pudieron procesar los futuros ROFEX (dataset {ds_fut}): {e}")
 
-    # Devaluación anualizada ROFEX a ~12m (para el escenario DL por defecto)
-    rofex_12m = interp_futuros_annual(fut_curve, 365) if not fut_curve.empty else None
+    # Devaluación anualizada de referencia a ~12m.
+    # 1º intento: curva de futuros ROFEX. Si no es confiable (dataset en otra escala,
+    # tenors sin cotización), se usa la devaluación implícita de los propios bonos DL.
+    rofex_12m = interp_futuros_annual(fut_curve, 365) if (fut_curve is not None and not fut_curve.empty) else None
     rofex_12m = None if (rofex_12m is None or pd.isna(rofex_12m)) else round(float(rofex_12m), 1)
+    deval_source = "ROFEX (curva de futuros)"
+    if rofex_12m is None:
+        rofex_12m = deval_implicita_desde_bonos(fija_df, dl_df, params_fija, horizon_days=365)
+        deval_source = "Implícita de bonos DL (ROFEX no confiable)"
 
     # ---- Panel de ESCENARIOS (editable) ----
     st.markdown("#### 🎚️ Escenario macro (12 meses)")
@@ -895,8 +1040,11 @@ with tab_be:
     with e3:
         st.caption(f"**Referencias de mercado hoy** — REM inflación 12m: "
                    f"**{('%.1f%%' % rem_val) if rem_val is not None else 'N/D'}**  ·  "
-                   f"ROFEX devaluación 12m: **{('%.1f%%' % rofex_12m) if rofex_12m is not None else 'N/D'}**  ·  "
-                   f"Spot ROFEX: **{('%.1f' % fut_spot) if fut_spot else '—'}**")
+                   f"Devaluación 12m: **{('%.1f%%' % rofex_12m) if rofex_12m is not None else 'N/D'}**  ·  "
+                   f"Spot: **{('%.1f' % fut_spot) if fut_spot else '—'}**")
+        st.caption(f"Fuente devaluación: _{deval_source}_.")
+        if not fut_diag.get("ok", False):
+            st.caption(f"⚠️ Curva ROFEX: {fut_diag.get('motivo', 'no disponible')}.")
 
     # ---- Motor de carry por escenario ----
     carry_cer = carry_scenario(cer_df, fija_df, "CER", infl_esc, params_fija) if not cer_df.empty else pd.DataFrame()
@@ -990,7 +1138,9 @@ with tab_be:
         if not carry_dl.empty:
             fig = plot_breakeven(
                 carry_dl, "Devaluación breakeven implícita por plazo", COLORS["dl"],
-                ref_value=rofex_12m, ref_label=f"ROFEX 12m: {rofex_12m:.1f}%" if rofex_12m is not None else None,
+                ref_value=rofex_12m,
+                ref_label=(f"Deval. 12m ({'ROFEX' if fut_diag.get('ok') else 'implícita'}): {rofex_12m:.1f}%"
+                           if rofex_12m is not None else None),
             )
             if fig is not None and rofex_12m is not None and abs(deval_esc - rofex_12m) > 0.05:
                 fig.add_hline(y=deval_esc, line_dash="dot", line_color=COLORS["dl"],
@@ -1006,14 +1156,54 @@ with tab_be:
             st.dataframe(carry_dl[cols_show].sort_values("Excess_pp", ascending=False)
                          if "Excess_pp" in carry_dl.columns else carry_dl[cols_show],
                          use_container_width=True, height=300)
-            st.caption("Análogo al CER pero con devaluación. La referencia ROFEX es la devaluación anualizada "
-                       "implícita en la curva de futuros a 12m; el breakeven de cada bono se compara contra tu escenario.")
+            st.caption("Análogo al CER pero en dólar-linked: TIR_DL es tasa en USD sobre la trayectoria del "
+                       "A3500. El retorno esperado en pesos es (1+TIR_DL)·(1+devaluación)−1, comparado contra la "
+                       "tasa fija de igual duration. La referencia de devaluación surge de "
+                       f"_{deval_source}_.")
         else:
             st.info("Faltan bonos DL y/o Fija operables para calcular breakevens.")
 
     st.divider()
 
-    # =====================  (C) VALOR RELATIVO: curvas superpuestas  =====================
+    # =====================  (C) SENSIBILIDAD: MAPAS DE CALOR  =====================
+    st.markdown("##### 🌡️ Sensibilidad — excess return por letra y escenario")
+    st.caption(
+        "Cada celda es el **excess return** (en pp) de tener la cobertura vs. la tasa fija comparable, "
+        "para una inflación/devaluación anual dada. **Verde**: conviene la cobertura (CER/DL). **Rojo**: "
+        "conviene la tasa fija. La **✕** en cada fila es el breakeven de ese bono (donde el excess = 0); "
+        "la línea vertical punteada es tu escenario. Leé una fila de izquierda a derecha para ver a partir "
+        "de qué nivel de inflación/devaluación conviene cubrirse con esa letra."
+    )
+
+    hcol1, hcol2 = st.columns(2)
+    with hcol1:
+        if not carry_cer.empty:
+            rng = st.slider("Rango de inflación anual (%) — eje del heatmap CER",
+                            min_value=0.0, max_value=80.0,
+                            value=(max(0.0, (rem_val or 25) - 15), (rem_val or 25) + 20),
+                            step=1.0, key="rng_cer")
+            fig_h = build_heatmap(carry_cer, "CER", rng[0], rng[1], n=30, escenario_marker=infl_esc)
+            if fig_h is not None:
+                st.plotly_chart(fig_h, use_container_width=True)
+        else:
+            st.info("Sin datos CER para el heatmap.")
+
+    with hcol2:
+        if not carry_dl.empty:
+            base_dev = rofex_12m if rofex_12m is not None else 25.0
+            rng2 = st.slider("Rango de devaluación anual (%) — eje del heatmap DL",
+                             min_value=-10.0, max_value=120.0,
+                             value=(max(-10.0, base_dev - 20), base_dev + 30),
+                             step=1.0, key="rng_dl")
+            fig_h2 = build_heatmap(carry_dl, "DL", rng2[0], rng2[1], n=30, escenario_marker=deval_esc)
+            if fig_h2 is not None:
+                st.plotly_chart(fig_h2, use_container_width=True)
+        else:
+            st.info("Sin datos DL para el heatmap.")
+
+    st.divider()
+
+    # =====================  (D) VALOR RELATIVO: curvas superpuestas  =====================
     st.markdown("##### 📈 Curvas en pesos superpuestas (valor relativo a igual duration)")
     d3 = latest_sob[latest_sob["Clase"].isin(["CER", "Fija", "DL", "Dual"])].copy()
     if not d3.empty:
@@ -1031,11 +1221,14 @@ with tab_be:
     with st.expander("Ver curva de futuros ROFEX / REM crudos (auditoría de datos)"):
         cc, cd = st.columns(2)
         with cc:
-            st.markdown("**Curva ROFEX (implícita, por plazo)**")
-            if not fut_curve.empty:
+            st.markdown("**Curva de devaluación implícita (por plazo)**")
+            if fut_curve is not None and not fut_curve.empty:
                 st.dataframe(fut_curve, use_container_width=True, height=240)
+                st.caption(f"Spot {fut_spot:.1f} · tenors válidos {fut_diag.get('tenors_validos','?')}/"
+                           f"{fut_diag.get('tenors_totales','?')} · fuente: {deval_source}")
             else:
-                st.caption("Sin datos de futuros.")
+                st.caption(f"Sin curva de futuros utilizable: {fut_diag.get('motivo','—')}. "
+                           f"Se usó devaluación implícita de bonos DL como referencia.")
         with cd:
             st.markdown("**REM — inflación esperada (últimos)**")
             if rem_val is not None:
