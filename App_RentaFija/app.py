@@ -192,7 +192,8 @@ def normalize_dataset(df: pd.DataFrame) -> pd.DataFrame:
     ren = {"symbol": "Ticker", "irr": "TIR", "modified duration": "MD",
            "convexity": "Convexidad", "parity": "Paridad", "residual value": "Valor Residual",
            "market segment": "Segmento", "coupon structure": "CouponStructure",
-           "issue currency": "IssueCcy", "trading currency": "TradingCcy"}
+           "issue currency": "IssueCcy", "trading currency": "TradingCcy",
+           "volume": "Volumen", "issuer": "Emisor"}
     df.rename(columns={k: v for k, v in ren.items() if k in df.columns}, inplace=True)
 
     if "Date" in df.columns:
@@ -201,9 +202,11 @@ def normalize_dataset(df: pd.DataFrame) -> pd.DataFrame:
         df["TIR"] = pd.to_numeric(df["TIR"], errors="coerce") * 100
     if "MD" in df.columns:
         df["MD"] = pd.to_numeric(df["MD"], errors="coerce")
+    if "Volumen" in df.columns:
+        df["Volumen"] = pd.to_numeric(df["Volumen"], errors="coerce")
 
-    wanted = ["Date", "Ticker", "Industry", "law", "Segmento", "CouponStructure",
-              "IssueCcy", "TradingCcy", "TIR", "MD", "Convexidad", "Paridad", "Valor Residual"]
+    wanted = ["Date", "Ticker", "Industry", "Emisor", "law", "Segmento", "CouponStructure",
+              "IssueCcy", "TradingCcy", "TIR", "MD", "Convexidad", "Paridad", "Valor Residual", "Volumen"]
     df = df[[c for c in wanted if c in df.columns]].copy()
     for c in ["TIR", "MD", "Convexidad", "Paridad"]:
         if c in df.columns:
@@ -230,8 +233,9 @@ def build_ons_table(latest_df: pd.DataFrame, ons_df: pd.DataFrame) -> pd.DataFra
     return df.merge(o[["Ticker", "Calificacion", "Lamina_Minima"]], on="Ticker", how="left")
 
 
-# Bonos reestructurados/defaulteados o de baja operabilidad que ensucian el fit
-# (PARP/DICP/CUAP/DIP0/PAP0/PARY/TVY0/PAY0 y variantes C/D). No se operan para carry.
+# Bonos de las reestructuraciones 2005/2010 (Par/Discount/Cuasipar): son performing
+# pero suelen ser ilíquidos y con estructura de cupón atípica que ensucia el fit de
+# la curva CER moderna. Se excluyen por LIQUIDEZ/COMPARABILIDAD, no por default.
 LEGACY_PREFIXES = ("PARP", "DICP", "CUAP", "DIP0", "PAP0", "PARY", "PAY0", "TVY0", "DICPD", "CUAPC")
 
 
@@ -603,13 +607,19 @@ def get_futuros_curva(df_fut_raw: pd.DataFrame):
                      "Deval_periodo_%": round(deval_periodo, 2),
                      "Deval_anualizada_%": round(deval_anual, 2)})
 
+    if not rows:
+        diag["ok"] = False
+        diag["tenors_validos"] = 0
+        diag["tenors_totales"] = len(tenor_cols)
+        diag["motivo"] = ("ningún tenor pasó la validación de plausibilidad vs spot "
+                          "(precios en escala distinta al spot, o sin cotización) — "
+                          "se usará devaluación implícita de los bonos DL")
+        return pd.DataFrame(), spot, fecha, diag
+
     df_curva = pd.DataFrame(rows).sort_values("Días").reset_index(drop=True)
-    diag["ok"] = not df_curva.empty
+    diag["ok"] = True
     diag["tenors_validos"] = len(df_curva)
     diag["tenors_totales"] = len(tenor_cols)
-    if df_curva.empty:
-        diag["motivo"] = ("ningún tenor pasó la validación de plausibilidad vs spot "
-                          "(precios en escala distinta al spot) — se usará devaluación implícita de los bonos DL")
     return df_curva, spot, fecha, diag
 
 
@@ -785,17 +795,32 @@ def build_heatmap(df_carry: pd.DataFrame, kind: str, esc_min: float, esc_max: fl
     return fig
 
 
-def drop_short_outliers(df: pd.DataFrame, min_md: float = 0.15,
-                        tir_abs_max: float = 60.0) -> pd.DataFrame:
-    """Descarta instrumentos ultra-cortos con TIR anualizada explosiva (p.ej. una
-    LECER a días de vencer con tasa real muy negativa/positiva) que distorsionan el
-    fit de curva y el breakeven del tramo corto. No los borra del universo global,
-    solo del set que alimenta la curva de tasa fija y los breakevens."""
-    if df.empty:
-        return df
-    out = df.copy()
-    mask = (out["MD"] >= min_md) & (out["TIR"].abs() <= tir_abs_max)
-    return out[mask].reset_index(drop=True)
+def split_curve_outliers(df: pd.DataFrame, min_md: float = 0.3,
+                         tir_lo: float = -10.0, tir_hi: float = 200.0):
+    """Separa el universo en (limpios, sospechosos) para el fit de curva.
+
+    Un instrumento va a 'sospechosos' si:
+      - MD < min_md (típicamente < 0.3 años: a días de vencer la TIR anualizada se
+        vuelve numéricamente inestable — el interés corrido domina el precio), o
+      - TIR fuera de un rango sensato para pesos/USD (tasa real muy negativa o
+        nominal explosiva) que delata precio o cupón mal cargado.
+
+    Los 'limpios' alimentan el fit Nelson-Siegel y los breakevens; los 'sospechosos'
+    se muestran aparte con un warning, no se ocultan (el analista debe verlos)."""
+    if df is None or df.empty:
+        return df, pd.DataFrame()
+    d = df.copy()
+    tir = pd.to_numeric(d["TIR"], errors="coerce")
+    md = pd.to_numeric(d["MD"], errors="coerce")
+    ok = (md >= min_md) & (tir >= tir_lo) & (tir <= tir_hi)
+    return d[ok].reset_index(drop=True), d[~ok].reset_index(drop=True)
+
+
+def drop_short_outliers(df: pd.DataFrame, min_md: float = 0.3,
+                        tir_lo: float = -10.0, tir_hi: float = 200.0) -> pd.DataFrame:
+    """Wrapper retrocompatible: devuelve solo los limpios."""
+    limpios, _ = split_curve_outliers(df, min_md, tir_lo, tir_hi)
+    return limpios
 
 st.set_page_config(page_title="Renta Fija PRO — Curvas, Spreads, Breakevens y Carry Trade", layout="wide")
 
@@ -914,13 +939,19 @@ with tab_ons:
             st.plotly_chart(fig_ons, use_container_width=True)
 
         st.subheader("Valor relativo (cheap / rich vs curva NS)")
+        # Flag de liquidez: marca los de volumen bajo (percentil 25 del universo filtrado)
+        if "Volumen" in df_ons_f.columns and df_ons_f["Volumen"].notna().any():
+            umbral_liq = df_ons_f["Volumen"].quantile(0.25)
+            df_ons_f["Liquidez"] = np.where(df_ons_f["Volumen"] <= umbral_liq, "🔸 Baja", "✅ OK")
         cols_show = [c for c in ["Ticker", "TIR", "MD", "Convexidad", "Paridad", "Calificacion",
-                                 "Lamina_Minima", "TIR_Curva", "Residuo_bps", "Señal"] if c in df_ons_f.columns]
+                                 "Lamina_Minima", "Volumen", "Liquidez", "TIR_Curva", "Residuo_bps",
+                                 "Señal"] if c in df_ons_f.columns]
         st.dataframe(df_ons_f[cols_show].sort_values("Residuo_bps", ascending=False),
                      use_container_width=True, height=380)
         st.caption("Residuo = TIR observada − TIR teórica de la curva. Positivo (>50 bps): rinde por encima de "
                    "sus comparables de igual duration → candidato *barato*. Negativo: *caro*. "
-                   "Validar siempre contra liquidez, calificación y riesgo emisor puntual.")
+                   "**Columna Volumen** (última rueda) y flag de liquidez: un residuo alto en un bono 🔸 de baja "
+                   "liquidez suele ser espejismo — el precio no refleja mercado real. Cruzá siempre residuo con volumen.")
     else:
         st.info("No hay ONs que pasen los filtros actuales.")
 
@@ -934,7 +965,15 @@ with tab_bonos:
     lb = latest_df[latest_df["Ticker"].isin(sel)].copy()
     lb["Grupo"] = lb["Ticker"].apply(classify_bono)
 
+    # Aviso de tickers seleccionados que no están en el snapshot (antes desaparecían sin explicación)
+    faltantes = [t for t in sel if t not in set(lb["Ticker"])]
+    if faltantes:
+        st.info(f"Sin dato en el último snapshot ({pd.Timestamp(most_recent_date).strftime('%d/%m/%Y') if most_recent_date is not None else '—'}): "
+                f"**{', '.join(faltantes)}**. Puede ser por falta de cotización ese día, ticker no listado en el dataset, "
+                f"o especie no operada. No se grafican para no inducir a error.")
+
     if not lb.empty:
+        # Fit propio por grupo y señal cheap/rich (igual criterio que ONs)
         fig_b, params_b = plot_curve_pro(
             lb, "Soberanos Hard Dollar — TIR vs MD por legislación", fecha=most_recent_date,
             group_col="Grupo", group_colors={"GD": COLORS["gd"], "AL": COLORS["al"], "BOPREAL": COLORS["bopreal"]},
@@ -943,9 +982,25 @@ with tab_bonos:
         if fig_b is not None:
             st.plotly_chart(fig_b, use_container_width=True)
 
-        lb["TIR/MD"] = (lb["TIR"] / lb["MD"]).round(2)
-        st.subheader("Snapshot (fecha más reciente)")
-        st.dataframe(lb.sort_values(["Grupo", "Ticker"]), use_container_width=True, height=320)
+        # Señal cheap/rich: para GD y AL usamos su propio fit de grupo; BOPREAL aparte
+        partes = []
+        for g, dfg in lb.groupby("Grupo"):
+            p = (params_b or {}).get(g)
+            partes.append(cheap_rich(dfg, p) if p is not None else dfg.assign(TIR_Curva=np.nan, Residuo_bps=np.nan, Señal="⚪ s/fit"))
+        lb_cr = pd.concat(partes, ignore_index=True)
+        lb_cr["TIR/MD"] = (lb_cr["TIR"] / lb_cr["MD"]).round(2)
+
+        st.subheader("Snapshot con valor relativo (cheap/rich vs curva de su grupo)")
+        cols_hd = [c for c in ["Ticker", "Grupo", "TIR", "MD", "Convexidad", "Paridad", "Volumen",
+                               "TIR/MD", "TIR_Curva", "Residuo_bps", "Señal"] if c in lb_cr.columns]
+        st.dataframe(lb_cr[cols_hd].sort_values(["Grupo", "Residuo_bps"], ascending=[True, False]),
+                     use_container_width=True, height=340)
+        st.caption("Señal cheap/rich = TIR observada − TIR teórica de la curva **de su propia legislación** "
+                   "(GD contra GD, AL contra AL). Un AL barato no es comparable con un GD barato: son curvas distintas. "
+                   "**BOPREAL es deuda del BCRA, no del Tesoro** — su riesgo de crédito es del Banco Central "
+                   "(reservas), no soberano puro; no se lo mezcla en la curva GD/AL.")
+    else:
+        st.info("Ningún bono seleccionado tiene datos en el último snapshot.")
 
     st.subheader("Spread por legislación: AL/AE − GD")
     spreads = spread_series(df_norm)
@@ -954,7 +1009,8 @@ with tab_bonos:
         st.dataframe(stats, use_container_width=True, height=240)
         st.caption("Z-score sobre 252 ruedas. Un spread muy por encima de su media histórica (z ≥ 1.5) indica que la ley "
                    "local está inusualmente castigada: si se espera compresión, el bono AL captura ese exceso de rendimiento. "
-                   "Un z ≤ −1.5 sugiere que el premio por ley NY está barato en términos relativos.")
+                   "Un z ≤ −1.5 sugiere que el premio por ley NY está barato en términos relativos. "
+                   "Los pares se arman por año de vencimiento; si falta una pata (p.ej. no hay AL46 contra GD46), ese año no aparece.")
         fig_sp = plot_spread_history(spreads)
         if fig_sp is not None:
             st.plotly_chart(fig_sp, use_container_width=True)
@@ -980,17 +1036,34 @@ with tab_be:
         st.info("No se encontraron soberanos en pesos operables en el dataset (revisar filtros/segmento).")
         st.stop()
 
-    fija_df = drop_short_outliers(latest_sob[latest_sob["Clase"] == "Fija"].dropna(subset=["MD", "TIR"]))
-    cer_df = drop_short_outliers(latest_sob[latest_sob["Clase"] == "CER"].dropna(subset=["MD", "TIR"]))
-    dl_df = drop_short_outliers(latest_sob[latest_sob["Clase"] == "DL"].dropna(subset=["MD", "TIR"]))
+    fija_all = latest_sob[latest_sob["Clase"] == "Fija"].dropna(subset=["MD", "TIR"])
+    cer_all = latest_sob[latest_sob["Clase"] == "CER"].dropna(subset=["MD", "TIR"])
+    dl_all = latest_sob[latest_sob["Clase"] == "DL"].dropna(subset=["MD", "TIR"])
+    fija_df, fija_susp = split_curve_outliers(fija_all)
+    cer_df, cer_susp = split_curve_outliers(cer_all)
+    dl_df, dl_susp = split_curve_outliers(dl_all)
+    susp_total = pd.concat([cer_susp.assign(Clase="CER"), fija_susp.assign(Clase="Fija"),
+                            dl_susp.assign(Clase="DL")], ignore_index=True) if any(
+        [not cer_susp.empty, not fija_susp.empty, not dl_susp.empty]) else pd.DataFrame()
     params_fija, _ = fit_ns(fija_df["MD"], fija_df["TIR"]) if len(fija_df) >= 5 else (None, None)
+
+    if not susp_total.empty:
+        with st.expander(f"⚠️ {len(susp_total)} instrumento(s) excluidos del fit por MD<0.3 o TIR fuera de rango "
+                         f"(precio/cupón a revisar) — clic para ver", expanded=False):
+            cols_s = [c for c in ["Ticker", "Clase", "MD", "TIR", "Paridad"] if c in susp_total.columns]
+            st.dataframe(susp_total[cols_s].sort_values("MD"), use_container_width=True, height=180)
+            st.caption("Estos NO entran a la curva Nelson-Siegel ni a los breakevens porque distorsionan el tramo "
+                       "corto (la TIR anualizada de un bono a días de vencer es numéricamente inestable). "
+                       "Se muestran para que los audites, no se ocultan.")
 
     counts = latest_sob["Clase"].value_counts()
     with st.expander(f"Universo operable: Fija {counts.get('Fija',0)} · CER {counts.get('CER',0)} · "
                      f"DL {counts.get('DL',0)} · Dual {counts.get('Dual',0)} — clic para reclasificar", expanded=False):
-        st.caption("Ya se excluyeron especies en USD, defaulteados (PARP/DICP/CUAP/…) y precios fuera de rango. "
-                   "Reclasificá acá solo si querés forzar algún caso borde (p.ej. mover un Dual a CER).")
-        for k in ["CER", "Fija", "DL"]:
+        st.caption("Se excluyeron especies en USD (C/D) y bonos de reestructuración 2005/2010 "
+                   "(PARP/DICP/CUAP: son performing, pero ilíquidos y de estructura atípica, no defaulteados). "
+                   "Reclasificá acá si querés forzar un caso borde (p.ej. mover un Dual a CER según cómo esperás "
+                   "que termine indexando).")
+        for k in ["CER", "Fija", "DL", "Dual"]:
             auto = sorted(latest_sob.loc[latest_sob["Clase"] == k, "Ticker"].astype(str).unique())
             pick = st.multiselect(f"{k}", options=sorted(latest_sob["Ticker"].astype(str).unique()),
                                   default=auto, key=f"pick_{k}")
@@ -1006,22 +1079,24 @@ with tab_be:
         st.warning(f"No se pudo procesar el REM (dataset {ds_rem}): {e}")
 
     fut_curve, fut_spot, fut_fecha, fut_diag = pd.DataFrame(), None, None, {"ok": False, "motivo": "no descargado"}
+    fut_error_tecnico = None
     try:
         with st.spinner("Futuros ROFEX…"):
             raw_fut = download_dataset(api_key.strip(), int(ds_fut))
         fut_curve, fut_spot, fut_fecha, fut_diag = get_futuros_curva(raw_fut)
     except Exception as e:
-        st.warning(f"No se pudieron procesar los futuros ROFEX (dataset {ds_fut}): {e}")
+        fut_error_tecnico = f"{type(e).__name__}: {e}"
 
     # Devaluación anualizada de referencia a ~12m.
-    # 1º intento: curva de futuros ROFEX. Si no es confiable (dataset en otra escala,
-    # tenors sin cotización), se usa la devaluación implícita de los propios bonos DL.
+    # 1º intento: curva de futuros ROFEX. Si no está disponible, se usa la
+    # devaluación implícita de los propios bonos DL (breakeven fija-vs-DL a 1 año).
     rofex_12m = interp_futuros_annual(fut_curve, 365) if (fut_curve is not None and not fut_curve.empty) else None
     rofex_12m = None if (rofex_12m is None or pd.isna(rofex_12m)) else round(float(rofex_12m), 1)
-    deval_source = "ROFEX (curva de futuros)"
-    if rofex_12m is None:
+    if rofex_12m is not None:
+        deval_source = "ROFEX (curva de futuros)"
+    else:
         rofex_12m = deval_implicita_desde_bonos(fija_df, dl_df, params_fija, horizon_days=365)
-        deval_source = "Implícita de bonos DL (ROFEX no confiable)"
+        deval_source = "Devaluación implícita de bonos DL (fallback)"
 
     # ---- Panel de ESCENARIOS (editable) ----
     st.markdown("#### 🎚️ Escenario macro (12 meses)")
@@ -1043,8 +1118,12 @@ with tab_be:
                    f"Devaluación 12m: **{('%.1f%%' % rofex_12m) if rofex_12m is not None else 'N/D'}**  ·  "
                    f"Spot: **{('%.1f' % fut_spot) if fut_spot else '—'}**")
         st.caption(f"Fuente devaluación: _{deval_source}_.")
-        if not fut_diag.get("ok", False):
-            st.caption(f"⚠️ Curva ROFEX: {fut_diag.get('motivo', 'no disponible')}.")
+        if fut_error_tecnico is not None:
+            st.caption(f"⚙️ Falla técnica al bajar futuros (dataset {ds_fut}): `{fut_error_tecnico}`. "
+                       f"No es un juicio de calidad del mercado, es un problema de pipeline; "
+                       f"se usó el fallback de bonos DL.")
+        elif not fut_diag.get("ok", False):
+            st.caption(f"ℹ️ Curva ROFEX sin tenors utilizables: {fut_diag.get('motivo', 'no disponible')}.")
 
     # ---- Motor de carry por escenario ----
     carry_cer = carry_scenario(cer_df, fija_df, "CER", infl_esc, params_fija) if not cer_df.empty else pd.DataFrame()
@@ -1054,11 +1133,15 @@ with tab_be:
     st.markdown("#### 📌 Tablero de decisión")
     k1, k2, k3, k4 = st.columns(4)
 
+    # NOTA: el delta se define como (breakeven - referencia). Signo negativo = el
+    # mercado pricea MENOS inflación/deval que la referencia → la cobertura luce
+    # barata (bueno para quien quiere cubrirse). Usamos delta_color="inverse" para
+    # que ese caso (delta<0) se muestre en verde de forma coherente con la lectura.
     be_cer_short = carry_cer[carry_cer["MD"] <= 1.5]["Breakeven_%anual"].mean() if not carry_cer.empty else np.nan
     if pd.notna(be_cer_short) and rem_val is not None:
-        gap_cer = rem_val - be_cer_short
+        delta_cer = be_cer_short - rem_val  # breakeven vs REM
         k1.metric("Breakeven inflación (tramo corto)", f"{be_cer_short:.1f}%",
-                  f"{gap_cer:+.1f} pp vs REM", delta_color="normal")
+                  f"{delta_cer:+.1f} pp vs REM ({rem_val:.1f}%)", delta_color="inverse")
     else:
         k1.metric("Breakeven inflación (corto)", f"{be_cer_short:.1f}%" if pd.notna(be_cer_short) else "—")
 
@@ -1071,8 +1154,10 @@ with tab_be:
 
     be_dl_short = carry_dl[carry_dl["MD"] <= 1.5]["Breakeven_%anual"].mean() if not carry_dl.empty else np.nan
     if pd.notna(be_dl_short) and rofex_12m is not None:
-        gap_dl = rofex_12m - be_dl_short
-        k3.metric("Breakeven devaluación (corto)", f"{be_dl_short:.1f}%", f"{gap_dl:+.1f} pp vs ROFEX")
+        delta_dl = be_dl_short - rofex_12m  # breakeven vs referencia de devaluación
+        ref_txt = "ROFEX" if fut_diag.get("ok") else "impl."
+        k3.metric("Breakeven devaluación (corto)", f"{be_dl_short:.1f}%",
+                  f"{delta_dl:+.1f} pp vs {ref_txt} ({rofex_12m:.1f}%)", delta_color="inverse")
     else:
         k3.metric("Breakeven devaluación (corto)", f"{be_dl_short:.1f}%" if pd.notna(be_dl_short) else "—")
 
@@ -1244,51 +1329,87 @@ with tab_be:
 # ---------------------------------------------------------------------
 with tab_insights:
     st.subheader("🎯 Resumen ejecutivo para el asesor")
+    st.caption("Síntesis automática de las 3 pestañas. Reacciona a los filtros y escenarios que elijas.")
     bullets = []
+    caveats = []
 
+    # --- Hard Dollar: forma de curva GD ---
     lb_all = latest_df[latest_df["Ticker"].isin(BONOS_GD)].dropna(subset=["MD", "TIR"])
     if len(lb_all) >= 3:
         corto = lb_all.nsmallest(2, "MD")["TIR"].mean()
         largo = lb_all.nlargest(2, "MD")["TIR"].mean()
         pend = largo - corto
-        forma = "invertida (el mercado exige más tasa en el tramo corto → estrés de corto plazo)" if pend < -0.5 \
+        forma = "invertida (más tasa en el tramo corto → estrés de corto plazo)" if pend < -0.5 \
             else ("empinada (premio por extender duration)" if pend > 0.5 else "plana")
-        bullets.append(f"**Curva GD {forma}.** Tramo corto ≈ {corto:.1f}%, tramo largo ≈ {largo:.1f}% "
+        bullets.append(f"**Hard Dollar — curva GD {forma}.** Tramo corto ≈ {corto:.1f}%, largo ≈ {largo:.1f}% "
                        f"(pendiente {pend:+.1f} pp).")
 
+    # --- Spread legislación ---
     try:
         stats_i = spread_stats(spread_series(df_norm))
         if not stats_i.empty:
             ext = stats_i.loc[stats_i["Z_Score"].abs().idxmax()]
             if abs(ext["Z_Score"]) >= 1.5:
-                bullets.append(f"**Spread por legislación 20{int(ext['Numero'])} en extremo histórico** "
-                               f"(z = {ext['Z_Score']:+.2f}; actual {ext['Spread_Actual']:.2f} pp vs promedio "
-                               f"{ext['Spread_Prom_252']:.2f} pp). {ext['Señal']}.")
+                bullets.append(f"**Spread ley 20{int(ext['Numero'])} en extremo histórico** "
+                               f"(z = {ext['Z_Score']:+.2f}; {ext['Spread_Actual']:.2f} pp vs prom. "
+                               f"{ext['Spread_Prom_252']:.2f}). {ext['Señal']}.")
             else:
-                bullets.append("Spreads AL/GD dentro de rangos normales (|z| < 1.5 en todos los pares): "
-                               "sin señal fuerte de arbitraje por legislación.")
+                bullets.append("**Spread AL/GD** dentro de rangos normales (|z| < 1.5 en todos los pares): "
+                               "sin señal fuerte de arbitraje por legislación hoy.")
     except Exception:
         pass
 
+    # --- ONs cheap/rich con chequeo de liquidez ---
     try:
         if "df_ons_f" in dir() and isinstance(df_ons_f, pd.DataFrame) and "Residuo_bps" in df_ons_f.columns \
                 and df_ons_f["Residuo_bps"].notna().any():
             top = df_ons_f.nlargest(3, "Residuo_bps")
-            names = ", ".join(f"{r.Ticker} (+{r.Residuo_bps:.0f} bps)" for r in top.itertuples())
-            bullets.append(f"**ONs con mayor exceso de TIR vs curva:** {names}. "
-                           f"Chequear liquidez y riesgo emisor antes de armar posición.")
+            def _tag(r):
+                liq = getattr(r, "Liquidez", "")
+                return f"{r.Ticker} (+{r.Residuo_bps:.0f} bps{', 🔸baja liq.' if 'Baja' in str(liq) else ''})"
+            names = ", ".join(_tag(r) for r in top.itertuples())
+            bullets.append(f"**ONs más baratas vs curva:** {names}. "
+                           f"Los marcados 🔸 tienen volumen bajo: el exceso de TIR puede ser espejismo de precio.")
     except Exception:
         pass
 
-    # Insight de Carry Trade (nuevo)
+    # --- Carry CER: usar EXACTAMENTE el breakeven del tramo corto del Tablero (consistencia) ---
     try:
-        latest_sob_i = classify_soberanos_pesos(latest_df)
-        if not latest_sob_i.empty:
-            be_cer_i = compute_breakevens(latest_sob_i, kind="CER")
-            if not be_cer_i.empty:
-                bullets.append(f"**Carry trade CER vs Fija:** breakeven promedio de mercado "
-                               f"{be_cer_i['Breakeven_%anual'].mean():.1f}% anual. Compará contra el REM "
-                               f"en la pestaña de Breakevens para ver de qué lado está el carry en cada plazo.")
+        if "carry_cer" in dir() and isinstance(carry_cer, pd.DataFrame) and not carry_cer.empty:
+            be_short = carry_cer[carry_cer["MD"] <= 1.5]["Breakeven_%anual"].mean()
+            be_full = carry_cer["Breakeven_%anual"].mean()
+            ref_rem = f" vs REM {rem_val:.1f}%" if ("rem_val" in dir() and rem_val is not None) else ""
+            lado = ""
+            if "rem_val" in dir() and rem_val is not None and pd.notna(be_short):
+                lado = (" → CER barato, conviene cubrirse" if be_short < rem_val - 1
+                        else (" → CER caro, conviene tasa fija" if be_short > rem_val + 1 else " → neutral"))
+            bullets.append(f"**Carry CER vs Fija:** breakeven de inflación tramo corto (MD≤1,5) "
+                           f"**{be_short:.1f}%**{ref_rem}{lado}. Curva completa: {be_full:.1f}% promedio. "
+                           f"(El Tablero usa el de tramo corto; este promedio full-curve es solo referencia agregada.)")
+    except Exception:
+        pass
+
+    # --- CAVEATS de datos sucios (lo que el diagnóstico pidió que Insights no ocultara) ---
+    try:
+        if "susp_total" in dir() and isinstance(susp_total, pd.DataFrame) and not susp_total.empty:
+            tk = ", ".join(susp_total.sort_values("MD")["Ticker"].head(4))
+            caveats.append(f"**{len(susp_total)} instrumento(s) en pesos excluidos del análisis** por MD<0,3 o TIR "
+                           f"fuera de rango ({tk}…): rendimientos inestables cerca del vencimiento. No operar sobre esos números.")
+    except Exception:
+        pass
+    try:
+        if "fut_error_tecnico" in dir() and fut_error_tecnico is not None:
+            caveats.append(f"**Curva de futuros ROFEX no disponible** (falla técnica de pipeline): la devaluación "
+                           f"de referencia se estimó desde bonos DL. Verificá antes de operar tipo de cambio.")
+        elif "fut_diag" in dir() and not fut_diag.get("ok", True):
+            caveats.append("**Curva ROFEX sin tenors utilizables**: devaluación de referencia estimada desde bonos DL.")
+    except Exception:
+        pass
+    # ONs con TIR negativa (dato a auditar)
+    try:
+        if "df_ons_f" in dir() and isinstance(df_ons_f, pd.DataFrame) and (df_ons_f["TIR"] < 0).any():
+            negs = ", ".join(df_ons_f[df_ons_f["TIR"] < 0]["Ticker"].astype(str).head(4))
+            caveats.append(f"**ONs con TIR negativa** ({negs}): precio/cupón a auditar; arrastran el tramo corto de la curva.")
     except Exception:
         pass
 
@@ -1298,18 +1419,22 @@ with tab_insights:
     else:
         st.info("Cargá datos en las otras pestañas para generar insights.")
 
+    if caveats:
+        st.markdown("##### ⚠️ Caveats de datos (revisar antes de operar)")
+        for c in caveats:
+            st.markdown(f"- {c}")
+
     st.divider()
     st.markdown(
         """
         **Cómo leer este panel (guía rápida):**
-        - *Cheap/rich*: un bono ±50 bps fuera de la curva NS no es automáticamente compra/venta;
-          suele reflejar liquidez, lámina mínima, o riesgo idiosincrático. Es un **filtro**, no una orden.
-        - *Spread AL−GD*: mide el premio que paga la ley local. Su z-score histórico indica si ese premio
-          está caro o barato **en términos relativos**, no si el país mejora o empeora.
-        - *Breakeven CER*: es la inflación que "empata" fija vs CER.
-        - *Carry trade*: compara ese breakeven de mercado contra una expectativa externa (REM o ROFEX).
-          Carry positivo (mercado pricea de más) favorece quedarse en tasa fija sin cobertura; carry negativo
-          favorece la cobertura (CER/DL). El carry en bps es una medida de la **oportunidad**, no una garantía:
-          la expectativa externa (REM/analistas, o el propio mercado de futuros) puede estar equivocada.
+        - *Cheap/rich*: un bono ±50 bps fuera de la curva NS no es orden de compra/venta; suele reflejar liquidez,
+          lámina mínima o riesgo idiosincrático. Es un **filtro**, no una señal. Cruzá siempre con volumen.
+        - *Spread AL−GD*: mide el premio de la ley local. Su z-score dice si está caro/barato **en términos relativos**,
+          no si el país mejora o empeora.
+        - *Breakeven*: inflación/devaluación de **indiferencia** entre cubrirse y tasa fija. El "tramo corto" (MD≤1,5)
+          es lo que muestra el Tablero; el "promedio full-curve" que a veces se cita es una agregación distinta —no los mezcles.
+        - *Carry por escenario*: el excess return depende de TU supuesto macro. Si no tenés visión, el default es el
+          consenso (REM/ROFEX), y ahí el carry ≈ 0 por construcción. El valor está en jugar escenarios propios.
         """
     )
