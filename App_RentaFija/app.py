@@ -48,6 +48,9 @@ from scipy.optimize import curve_fit
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import ScatterChart, LineChart, Reference, Series
+from openpyxl.chart.marker import Marker
+from openpyxl.formatting.rule import ColorScaleRule
 
 # =====================================================================
 # Configuración general y tema visual
@@ -917,6 +920,145 @@ def _xls_write_kv(ws, row: int, label: str, value, note: str | None = None) -> i
     return row + 1
 
 
+# ---------------------------------------------------------------------------
+# Gráficos nativos de Excel (editables) para la hoja Resumen.
+# Los datos de cada gráfico se escriben en una hoja auxiliar OCULTA (el chart de
+# Excel necesita referenciar celdas reales, no puede tomar un DataFrame directo).
+# ---------------------------------------------------------------------------
+
+def _hidden_data_sheet(wb: Workbook, name: str):
+    if name in wb.sheetnames:
+        return wb[name]
+    ws = wb.create_sheet(name)
+    ws.sheet_state = "hidden"
+    return ws
+
+
+def _write_columns(ws, headers: list, columns: list, start_row: int = 1, start_col: int = 1) -> dict:
+    """Escribe columnas paralelas (una lista de listas, todas la misma cantidad de
+    filas o menos) en 'ws' a partir de (start_row, start_col). Devuelve un dict
+    {header: (col_idx, first_data_row, last_data_row)} para armar Reference() después."""
+    info = {}
+    for j, (h, coldata) in enumerate(zip(headers, columns)):
+        col = start_col + j
+        ws.cell(row=start_row, column=col, value=h).font = _XLS_HEADER_FONT
+        n = 0
+        for i, v in enumerate(coldata):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                continue
+            ws.cell(row=start_row + 1 + i, column=col, value=float(v) if isinstance(v, (int, float)) else v)
+            n += 1
+        info[h] = (col, start_row + 1, start_row + max(n, 1))
+    return info
+
+
+def _scatter_chart(title: str, x_title: str, y_title: str, height: float = 8.5, width: float = 16.0) -> ScatterChart:
+    ch = ScatterChart()
+    ch.title = title
+    ch.style = 2
+    ch.x_axis.title = x_title
+    ch.y_axis.title = y_title
+    ch.height = height
+    ch.width = width
+    return ch
+
+
+def _add_xy_series(chart: ScatterChart, data_ws, x_info: tuple, y_info: tuple, name: str,
+                   markers_only: bool = False, line_only: bool = False, color: str | None = None):
+    """x_info/y_info = (col_idx, first_row, last_row) de _write_columns."""
+    xcol, xr0, xr1 = x_info
+    ycol, yr0, yr1 = y_info
+    last = min(xr1, yr1)
+    xref = Reference(data_ws, min_col=xcol, min_row=xr0, max_row=last)
+    yref = Reference(data_ws, min_col=ycol, min_row=yr0, max_row=last)
+    s = Series(yref, xref, title=name)
+    if markers_only:
+        s.marker = Marker(symbol="circle", size=6)
+        s.graphicalProperties.line.noFill = True
+    if line_only:
+        s.marker = Marker(symbol="none")
+        s.smooth = False
+    if color:
+        s.marker.graphicalProperties.solidFill = color
+        s.graphicalProperties.line.solidFill = color
+    chart.series.append(s)
+
+
+def _pivot_spread_history(spreads: pd.DataFrame, max_rows: int = 120) -> pd.DataFrame:
+    """De spread_series() (Date, Numero, Spread largo) arma una tabla ancha
+    Date + una columna por año de vencimiento, para un LineChart nativo."""
+    if spreads is None or spreads.empty:
+        return pd.DataFrame()
+    d = spreads.copy().sort_values("Date")
+    piv = d.pivot_table(index="Date", columns="Numero", values="Spread", aggfunc="first")
+    piv = piv.tail(max_rows).reset_index()
+    piv.columns = ["Date"] + [f"20{c}" if len(str(c)) == 2 else str(c) for c in piv.columns[1:]]
+    return piv
+
+
+def _add_sensitivity_table(ws, df_carry: pd.DataFrame, kind: str, start_row: int, start_col: int = 6,
+                           n_cols: int = 9) -> int:
+    """Tabla de sensibilidad (instrumento x escenario) con formato condicional
+    rojo→blanco→verde, equivalente al heatmap de la app pero nativo de Excel.
+    Devuelve la fila siguiente libre."""
+    col_tir = "TIR_Real" if kind == "CER" else "TIR_DL"
+    if df_carry is None or df_carry.empty or col_tir not in df_carry.columns:
+        ws.cell(row=start_row, column=start_col,
+               value=f"Sensibilidad {kind}: sin datos.").font = _XLS_SUBTITLE_FONT
+        return start_row + 2
+
+    d = df_carry.dropna(subset=[col_tir, "TIR_Fija_interp", "MD"]).sort_values("MD")
+    if d.empty:
+        ws.cell(row=start_row, column=start_col,
+               value=f"Sensibilidad {kind}: sin datos.").font = _XLS_SUBTITLE_FONT
+        return start_row + 2
+
+    lo = float(d["Breakeven_%anual"].min()) - 8
+    hi = float(d["Breakeven_%anual"].max()) + 12
+    escenarios = np.linspace(max(lo, -5), hi, n_cols)
+
+    etiqueta = "Inflación" if kind == "CER" else "Devaluación"
+    ws.cell(row=start_row, column=start_col,
+           value=f"Sensibilidad {kind} vs Fija — excess return (pp) según {etiqueta.lower()} anual asumida").font = _XLS_TITLE_FONT
+    r = start_row + 2
+
+    headers = ["Instrumento", "MD", "Breakeven %"] + [f"{e:.0f}%" for e in escenarios]
+    for j, h in enumerate(headers):
+        c = ws.cell(row=r, column=start_col + j, value=h)
+        c.font = _XLS_HEADER_FONT
+        c.fill = _XLS_HEADER_FILL
+        c.alignment = Alignment(horizontal="center")
+        c.border = _XLS_BORDER
+    header_row = r
+    r += 1
+
+    for _, row in d.iterrows():
+        ws.cell(row=r, column=start_col, value=row["Ticker"]).font = _XLS_BODY_FONT
+        ws.cell(row=r, column=start_col + 1, value=round(float(row["MD"]), 2)).font = _XLS_BODY_FONT
+        ws.cell(row=r, column=start_col + 2, value=round(float(row["Breakeven_%anual"]), 1)).font = _XLS_BODY_FONT
+        vals = sensitivity_matrix(float(row[col_tir]), float(row["TIR_Fija_interp"]), escenarios)
+        for j, v in enumerate(vals):
+            c = ws.cell(row=r, column=start_col + 3 + j, value=round(float(v), 1))
+            c.font = _XLS_BODY_FONT
+            c.border = _XLS_BORDER
+            c.alignment = Alignment(horizontal="center")
+        r += 1
+    last_row = r - 1
+
+    rng = (f"{get_column_letter(start_col + 3)}{header_row + 1}:"
+           f"{get_column_letter(start_col + 2 + n_cols)}{last_row}")
+    rule = ColorScaleRule(start_type="min", start_color="B91C1C",
+                         mid_type="percentile", mid_value=50, mid_color="F8FAFC",
+                         end_type="max", end_color="15803D")
+    ws.conditional_formatting.add(rng, rule)
+
+    ws.cell(row=r, column=start_col, value=(
+        "Verde = conviene la cobertura bajo ese escenario. Rojo = conviene tasa fija. "
+        "La columna 'Breakeven %' es el punto exacto de indiferencia de cada instrumento."
+    )).font = _XLS_NOTE_FONT
+    return r + 2
+
+
 def build_excel_report(ctx: dict) -> bytes:
     """Arma el informe de Renta Fija en Excel (bytes, listo para st.download_button).
 
@@ -1000,6 +1142,138 @@ def build_excel_report(ctx: dict) -> bytes:
         "TIR anual efectiva. El breakeven es un punto de indiferencia, no una predicción."
     )).font = _XLS_NOTE_FONT
     ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
+
+    # ---------- Gráficos nativos (columna F en adelante, no chocan con el texto) ----------
+    ws.cell(row=1, column=6, value="Gráficos").font = _XLS_TITLE_FONT
+    data_ws = _hidden_data_sheet(wb, "_ChartData")
+    chart_anchor_row = 2
+
+    # 1) Curva de ONs: TIR observada (puntos) + TIR teórica de la curva NS (línea)
+    try:
+        df_ons_c = ctx.get("df_ons")
+        if df_ons_c is not None and not df_ons_c.empty and {"MD", "TIR"}.issubset(df_ons_c.columns):
+            d = df_ons_c.dropna(subset=["MD", "TIR"]).sort_values("MD")
+            info = _write_columns(data_ws, ["ONs_MD", "ONs_TIR", "ONs_TIRCurva"],
+                                  [d["MD"].tolist(), d["TIR"].tolist(),
+                                   d["TIR_Curva"].tolist() if "TIR_Curva" in d.columns else []],
+                                  start_row=1, start_col=1)
+            ch = _scatter_chart("Curva de ONs — TIR vs MD", "Modified Duration (años)", "TIR (%)")
+            _add_xy_series(ch, data_ws, info["ONs_MD"], info["ONs_TIR"], "TIR observada",
+                          markers_only=True, color="1F2A44")
+            if "TIR_Curva" in d.columns and d["TIR_Curva"].notna().any():
+                _add_xy_series(ch, data_ws, info["ONs_MD"], info["ONs_TIRCurva"], "Curva NS",
+                              line_only=True, color="C8963E")
+            ws.add_chart(ch, f"F{chart_anchor_row}")
+    except Exception:
+        pass
+    chart_anchor_row += 19
+
+    # 2) Curva Hard Dollar: un scatter por legislación (GD/AL/BOPREAL)
+    try:
+        df_hd_c = ctx.get("df_hd")
+        if df_hd_c is not None and not df_hd_c.empty and {"Grupo", "MD", "TIR"}.issubset(df_hd_c.columns):
+            ch2 = _scatter_chart("Soberanos Hard Dollar — TIR vs MD por legislación",
+                                "Modified Duration (años)", "TIR (%)")
+            colores_hd = {"GD": "2563EB", "AL": "DC2626", "BOPREAL": "059669"}
+            col_cursor = 4
+            for grupo, dg in df_hd_c.groupby("Grupo"):
+                dg = dg.dropna(subset=["MD", "TIR"]).sort_values("MD")
+                if dg.empty:
+                    continue
+                info_g = _write_columns(data_ws, [f"HD_{grupo}_MD", f"HD_{grupo}_TIR"],
+                                        [dg["MD"].tolist(), dg["TIR"].tolist()],
+                                        start_row=1, start_col=col_cursor)
+                _add_xy_series(ch2, data_ws, info_g[f"HD_{grupo}_MD"], info_g[f"HD_{grupo}_TIR"], grupo,
+                              markers_only=True, color=colores_hd.get(grupo, "64748B"))
+                col_cursor += 2
+            ws.add_chart(ch2, f"F{chart_anchor_row}")
+    except Exception:
+        pass
+    chart_anchor_row += 19
+
+    # 3) Breakeven CER + referencia REM
+    try:
+        df_cer_c = ctx.get("df_carry_cer")
+        if df_cer_c is not None and not df_cer_c.empty and {"MD", "Breakeven_%anual"}.issubset(df_cer_c.columns):
+            d = df_cer_c.dropna(subset=["MD", "Breakeven_%anual"]).sort_values("MD")
+            cols = ["BE_CER_MD", "BE_CER_Val"]
+            data = [d["MD"].tolist(), d["Breakeven_%anual"].tolist()]
+            rem_raw = ctx.get("rem_val_raw")
+            if rem_raw is not None:
+                cols += ["BE_CER_RefMD", "BE_CER_Ref"]
+                data += [[d["MD"].min(), d["MD"].max()], [rem_raw, rem_raw]]
+            info3 = _write_columns(data_ws, cols, data, start_row=1, start_col=20)
+            ch3 = _scatter_chart("Breakeven inflación — CER vs Fija", "Modified Duration (años)", "Breakeven (% anual)")
+            _add_xy_series(ch3, data_ws, info3["BE_CER_MD"], info3["BE_CER_Val"], "Breakeven CER",
+                          markers_only=True, color="7C3AED")
+            if rem_raw is not None:
+                _add_xy_series(ch3, data_ws, info3["BE_CER_RefMD"], info3["BE_CER_Ref"], "REM 12m",
+                              line_only=True, color="C8963E")
+            ws.add_chart(ch3, f"F{chart_anchor_row}")
+    except Exception:
+        pass
+    chart_anchor_row += 19
+
+    # 4) Breakeven DL + referencia de devaluación
+    try:
+        df_dl_c = ctx.get("df_carry_dl")
+        if df_dl_c is not None and not df_dl_c.empty and {"MD", "Breakeven_%anual"}.issubset(df_dl_c.columns):
+            d = df_dl_c.dropna(subset=["MD", "Breakeven_%anual"]).sort_values("MD")
+            cols = ["BE_DL_MD", "BE_DL_Val"]
+            data = [d["MD"].tolist(), d["Breakeven_%anual"].tolist()]
+            dev_raw = ctx.get("rofex_12m_raw")
+            if dev_raw is not None:
+                cols += ["BE_DL_RefMD", "BE_DL_Ref"]
+                data += [[d["MD"].min(), d["MD"].max()], [dev_raw, dev_raw]]
+            info4 = _write_columns(data_ws, cols, data, start_row=1, start_col=26)
+            ch4 = _scatter_chart("Breakeven devaluación — DL vs Fija", "Modified Duration (años)", "Breakeven (% anual)")
+            _add_xy_series(ch4, data_ws, info4["BE_DL_MD"], info4["BE_DL_Val"], "Breakeven DL",
+                          markers_only=True, color="EA580C")
+            if dev_raw is not None:
+                _add_xy_series(ch4, data_ws, info4["BE_DL_RefMD"], info4["BE_DL_Ref"], "Deval. 12m",
+                              line_only=True, color="C8963E")
+            ws.add_chart(ch4, f"F{chart_anchor_row}")
+    except Exception:
+        pass
+    chart_anchor_row += 19
+
+    # 5) Spread histórico por legislación (serie de tiempo)
+    try:
+        df_sp_hist = ctx.get("df_spread_hist")
+        if df_sp_hist is not None and not df_sp_hist.empty and "Date" in df_sp_hist.columns:
+            year_cols = [c for c in df_sp_hist.columns if c != "Date"]
+            cols = ["Spread_Date"] + [f"Spread_{c}" for c in year_cols]
+            fechas = [pd.Timestamp(x).to_pydatetime() for x in df_sp_hist["Date"]]
+            data = [fechas] + [df_sp_hist[c].tolist() for c in year_cols]
+            info5 = _write_columns(data_ws, cols, data, start_row=1, start_col=32)
+            lc = LineChart()
+            lc.title = "Spread por legislación (AL/AE − GD) — últimas ruedas"
+            lc.style = 2
+            lc.x_axis.title = "Fecha"
+            lc.y_axis.title = "Spread (pp de TIR)"
+            lc.height = 8.5
+            lc.width = 16.0
+            date_col, dr0, dr1 = info5["Spread_Date"]
+            xref = Reference(data_ws, min_col=date_col, min_row=dr0, max_row=dr1)
+            for yc in year_cols:
+                col_i, r0, r1 = info5[f"Spread_{yc}"]
+                yref = Reference(data_ws, min_col=col_i, min_row=r0 - 1, max_row=r1)
+                lc.add_data(yref, titles_from_data=True)
+            lc.set_categories(xref)
+            ws.add_chart(lc, f"F{chart_anchor_row}")
+    except Exception:
+        pass
+    chart_anchor_row += 20
+
+    # ---------- Tablas de sensibilidad (heatmap con formato condicional) ----------
+    try:
+        chart_anchor_row = _add_sensitivity_table(ws, ctx.get("df_carry_cer"), "CER", chart_anchor_row, start_col=6)
+    except Exception:
+        pass
+    try:
+        chart_anchor_row = _add_sensitivity_table(ws, ctx.get("df_carry_dl"), "DL", chart_anchor_row, start_col=6)
+    except Exception:
+        pass
 
     # ---------- Hoja 2: ONs ----------
     ws2 = wb.create_sheet("ONs - Valor Relativo")
@@ -1668,8 +1942,10 @@ with tab_export:
         ctx["infl_esc"] = infl_esc
         ctx["infl_es_rem"] = (rem_val is not None and abs(infl_esc - rem_val) < 0.05)
         ctx["rem_val_txt"] = f"{rem_val:.1f}%" if rem_val is not None else "N/D"
+        ctx["rem_val_raw"] = float(rem_val) if rem_val is not None else None
         ctx["deval_esc"] = deval_esc
         ctx["deval_source"] = deval_source
+        ctx["rofex_12m_raw"] = float(rofex_12m) if rofex_12m is not None else None
     except Exception:
         pass
 
@@ -1725,6 +2001,11 @@ with tab_export:
         ctx["df_spread"] = stats if "stats" in dir() and isinstance(stats, pd.DataFrame) else pd.DataFrame()
     except Exception:
         ctx["df_spread"] = pd.DataFrame()
+    try:
+        ctx["df_spread_hist"] = (_pivot_spread_history(spreads)
+                                if "spreads" in dir() and isinstance(spreads, pd.DataFrame) else pd.DataFrame())
+    except Exception:
+        ctx["df_spread_hist"] = pd.DataFrame()
     try:
         ctx["df_carry_cer"] = carry_cer if "carry_cer" in dir() and isinstance(carry_cer, pd.DataFrame) else pd.DataFrame()
     except Exception:
