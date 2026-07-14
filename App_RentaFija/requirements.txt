@@ -9,3 +9,4 @@ adjustText>=1.1
 Pillow>=10.0
 alphacast==0.1.8.7
 python-docx>=1.1
+openpyxl>=3.1
