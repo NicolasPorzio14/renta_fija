@@ -33,7 +33,7 @@ CAMBIOS RESPECTO A LA VERSIÓN ANTERIOR (por qué el breakeven no andaba bien):
      interpolada a la duration de cada bono.
 
 Requisitos:
-  pip install streamlit pandas numpy plotly scipy alphacast
+  pip install streamlit pandas numpy plotly scipy alphacast openpyxl
 """
 
 import io
@@ -45,6 +45,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from alphacast import Alphacast
 from scipy.optimize import curve_fit
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # =====================================================================
 # Configuración general y tema visual
@@ -822,6 +825,211 @@ def drop_short_outliers(df: pd.DataFrame, min_md: float = 0.3,
     limpios, _ = split_curve_outliers(df, min_md, tir_lo, tir_hi)
     return limpios
 
+
+# =====================================================================
+# Informe Excel — snapshot con las tablas e insights clave
+# =====================================================================
+
+_XLS_FONT = "Arial"
+_XLS_HEADER_FILL = PatternFill("solid", fgColor="1F2A44")
+_XLS_HEADER_FONT = Font(name=_XLS_FONT, bold=True, color="FFFFFF", size=10)
+_XLS_TITLE_FONT = Font(name=_XLS_FONT, bold=True, size=14, color="1F2A44")
+_XLS_SUBTITLE_FONT = Font(name=_XLS_FONT, size=10, italic=True, color="64748B")
+_XLS_LABEL_FONT = Font(name=_XLS_FONT, bold=True, size=10, color="1F2A44")
+_XLS_BODY_FONT = Font(name=_XLS_FONT, size=10)
+_XLS_NOTE_FONT = Font(name=_XLS_FONT, size=9, italic=True, color="64748B")
+_XLS_BORDER = Border(*(Side(style="thin", color="D1D5DB") for _ in range(4)))
+_XLS_ALERT_FILL = PatternFill("solid", fgColor="FEF3C7")
+
+# El informe es un SNAPSHOT (valores, no fórmulas): reproduce el estado de la app
+# en el momento de la descarga, no un modelo vivo que se recalcule en Excel.
+# Los textos de la UI ya son descriptivos ("🟢 Barato vs curva", "🔸 Baja"); el emoji es
+# redundante en un documento formal, así que simplemente se retira (no se reemplaza por
+# una etiqueta) para no duplicar la información en la celda.
+_EMOJI_STRIP = ["🟢", "🔴", "🔵", "⚪", "✅", "🔸", "🎯", "📌", "⚠️", "ℹ️", "⚙️", "**"]
+
+
+def _xls_clean(val):
+    """Convierte emojis/markdown de la UI a texto plano apto para un documento formal."""
+    if isinstance(val, str):
+        s = val
+        for tok in _EMOJI_STRIP:
+            s = s.replace(tok, "")
+        return " ".join(s.split())
+    if isinstance(val, (pd.Timestamp, datetime)):
+        return val.strftime("%d/%m/%Y")
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    return val
+
+
+def _xls_write_table(ws, df: pd.DataFrame, start_row: int, title: str | None = None) -> int:
+    """Escribe un DataFrame formateado (encabezado, bordes, ancho de columna) y
+    devuelve la fila siguiente libre."""
+    r = start_row
+    if title:
+        ws.cell(row=r, column=1, value=title).font = _XLS_TITLE_FONT
+        r += 2
+    if df is None or df.empty:
+        ws.cell(row=r, column=1, value="Sin datos disponibles para esta tabla.").font = _XLS_SUBTITLE_FONT
+        return r + 2
+
+    cols = list(df.columns)
+    for j, col in enumerate(cols, start=1):
+        c = ws.cell(row=r, column=j, value=str(col))
+        c.font = _XLS_HEADER_FONT
+        c.fill = _XLS_HEADER_FILL
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = _XLS_BORDER
+    header_row = r
+    r += 1
+
+    for _, row in df.iterrows():
+        for j, col in enumerate(cols, start=1):
+            val = _xls_clean(row[col])
+            c = ws.cell(row=r, column=j, value=val)
+            c.font = _XLS_BODY_FONT
+            c.border = _XLS_BORDER
+            if isinstance(val, (int, float)):
+                c.number_format = "0.00"
+                c.alignment = Alignment(horizontal="right")
+            else:
+                c.alignment = Alignment(horizontal="left")
+        r += 1
+
+    ws.freeze_panes = ws.cell(row=header_row + 1, column=1).coordinate
+    for j, col in enumerate(cols, start=1):
+        largo = [len(str(col))]
+        for v in df[col].tolist():
+            vv = _xls_clean(v)
+            largo.append(len(str(vv)) if vv is not None else 0)
+        ws.column_dimensions[get_column_letter(j)].width = min(max(10, max(largo) + 2), 42)
+    return r + 2
+
+
+def _xls_write_kv(ws, row: int, label: str, value, note: str | None = None) -> int:
+    """Escribe un par etiqueta/valor (para el resumen ejecutivo) y devuelve la fila siguiente."""
+    ws.cell(row=row, column=1, value=label).font = _XLS_LABEL_FONT
+    c = ws.cell(row=row, column=2, value=_xls_clean(value))
+    c.font = _XLS_BODY_FONT
+    if note:
+        ws.cell(row=row, column=3, value=note).font = _XLS_NOTE_FONT
+    return row + 1
+
+
+def build_excel_report(ctx: dict) -> bytes:
+    """Arma el informe de Renta Fija en Excel (bytes, listo para st.download_button).
+
+    'ctx' es un diccionario con las tablas y valores ya calculados en la app
+    (ver el punto de armado al final del script). No usa fórmulas: es la foto de
+    un momento dado, igual que lo que se ve en pantalla al momento de exportar.
+    """
+    wb = Workbook()
+
+    # ---------- Hoja 1: Resumen ejecutivo ----------
+    ws = wb.active
+    ws.title = "Resumen"
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["C"].width = 55
+
+    ws.cell(row=1, column=1, value="Renta Fija Argentina — Informe PRO").font = _XLS_TITLE_FONT
+    ws.cell(row=2, column=1, value=(
+        f"Generado {datetime.now().strftime('%d/%m/%Y %H:%M')} · Datos al "
+        f"{ctx.get('fecha_datos', '—')} · Herramienta de análisis, no recomendación de inversión."
+    )).font = _XLS_SUBTITLE_FONT
+
+    r = 4
+    ws.cell(row=r, column=1, value="Escenario macro utilizado").font = _XLS_LABEL_FONT
+    r += 1
+    r = _xls_write_kv(ws, r, "Inflación esperada (% i.a.)", ctx.get("infl_esc"),
+                      f"Fuente: REM {ctx.get('rem_val_txt','—')}" if ctx.get("infl_es_rem") else "Escenario propio del usuario")
+    r = _xls_write_kv(ws, r, "Devaluación esperada (% i.a.)", ctx.get("deval_esc"),
+                      f"Fuente: {ctx.get('deval_source','—')}")
+    r += 1
+
+    ws.cell(row=r, column=1, value="Tablero de decisión").font = _XLS_LABEL_FONT
+    r += 1
+    r = _xls_write_kv(ws, r, "Breakeven inflación (tramo corto MD≤1,5)", ctx.get("be_cer_short"),
+                      ctx.get("delta_cer_txt"))
+    r = _xls_write_kv(ws, r, "Mejor CER bajo el escenario", ctx.get("best_cer_txt"))
+    r = _xls_write_kv(ws, r, "Breakeven devaluación (tramo corto)", ctx.get("be_dl_short"),
+                      ctx.get("delta_dl_txt"))
+    r = _xls_write_kv(ws, r, "Señal dominante (CER vs Fija)", ctx.get("senal_dominante"))
+    r += 1
+
+    if ctx.get("lectura"):
+        ws.cell(row=r, column=1, value="Lectura").font = _XLS_LABEL_FONT
+        r += 1
+        cell = ws.cell(row=r, column=1, value=_xls_clean(ctx["lectura"]))
+        cell.font = _XLS_BODY_FONT
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
+        ws.row_dimensions[r].height = 45
+        r += 2
+
+    if ctx.get("bullets"):
+        ws.cell(row=r, column=1, value="Insights automáticos").font = _XLS_LABEL_FONT
+        r += 1
+        for b in ctx["bullets"]:
+            cell = ws.cell(row=r, column=1, value=f"• {_xls_clean(b)}")
+            cell.font = _XLS_BODY_FONT
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
+            ws.row_dimensions[r].height = 30
+            r += 1
+        r += 1
+
+    if ctx.get("caveats"):
+        ws.cell(row=r, column=1, value="Caveats de datos (revisar antes de operar)").font = Font(
+            name=_XLS_FONT, bold=True, size=10, color="92400E")
+        r += 1
+        for cv in ctx["caveats"]:
+            cell = ws.cell(row=r, column=1, value=f"• {_xls_clean(cv)}")
+            cell.font = _XLS_BODY_FONT
+            cell.fill = _XLS_ALERT_FILL
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
+            ws.row_dimensions[r].height = 30
+            r += 1
+        r += 1
+
+    ws.cell(row=r, column=1, value=(
+        "Supuestos: mismo horizonte de tenencia, sin reinversión de cupón ni costos de transacción; "
+        "TIR anual efectiva. El breakeven es un punto de indiferencia, no una predicción."
+    )).font = _XLS_NOTE_FONT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
+
+    # ---------- Hoja 2: ONs ----------
+    ws2 = wb.create_sheet("ONs - Valor Relativo")
+    _xls_write_table(ws2, ctx.get("df_ons"), 1, "Obligaciones Negociables — TIR, MD y valor relativo vs curva NS")
+
+    # ---------- Hoja 3: Bonos Hard Dollar ----------
+    ws3 = wb.create_sheet("Hard Dollar")
+    nr = _xls_write_table(ws3, ctx.get("df_hd"), 1, "Soberanos Hard Dollar — snapshot y cheap/rich por legislación")
+    _xls_write_table(ws3, ctx.get("df_spread"), nr, "Spread por legislación (AL/AE − GD), z-score 252 ruedas")
+
+    # ---------- Hoja 4: Breakeven & Carry CER ----------
+    ws4 = wb.create_sheet("Breakeven CER")
+    _xls_write_table(ws4, ctx.get("df_carry_cer"), 1,
+                     f"Inflación — CER vs Fija (escenario: {ctx.get('infl_esc','—')}% anual)")
+
+    # ---------- Hoja 5: Breakeven & Carry DL ----------
+    ws5 = wb.create_sheet("Breakeven DL")
+    _xls_write_table(ws5, ctx.get("df_carry_dl"), 1,
+                     f"Devaluación — DL vs Fija (escenario: {ctx.get('deval_esc','—')}% anual)")
+
+    # ---------- Hoja 6: Auditoría de exclusiones ----------
+    ws6 = wb.create_sheet("Auditoría - Excluidos")
+    _xls_write_table(ws6, ctx.get("df_excluidos"), 1,
+                     "Instrumentos excluidos del fit de curva y breakevens (MD<0,3 o TIR fuera de rango)")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 st.set_page_config(page_title="Renta Fija PRO — Curvas, Spreads, Breakevens y Carry Trade", layout="wide")
 
 st.markdown(
@@ -867,8 +1075,8 @@ with st.spinner("Descargando dataset principal..."):
 df_norm = normalize_dataset(raw)
 latest_df, most_recent_date = latest_snapshot(df_norm)
 
-tab_ons, tab_bonos, tab_be, tab_insights = st.tabs(
-    ["🏢 ONs", "💵 Bonos Hard Dollar", "⚖️ Breakevens & Carry Trade", "🎯 Insights"]
+tab_ons, tab_bonos, tab_be, tab_insights, tab_export = st.tabs(
+    ["🏢 ONs", "💵 Bonos Hard Dollar", "⚖️ Breakevens & Carry Trade", "🎯 Insights", "📥 Exportar Informe"]
 )
 
 # ---------------------------------------------------------------------
@@ -1438,3 +1646,118 @@ with tab_insights:
           consenso (REM/ROFEX), y ahí el carry ≈ 0 por construcción. El valor está en jugar escenarios propios.
         """
     )
+
+# ---------------------------------------------------------------------
+# TAB 5 — Exportar Informe (Excel)
+# ---------------------------------------------------------------------
+with tab_export:
+    st.markdown("### 📥 Informe de Renta Fija en Excel")
+    st.caption(
+        "Descarga un .xlsx con el resumen ejecutivo, el tablero de decisión, los insights y caveats, "
+        "y las tablas completas de ONs, Hard Dollar, Breakeven/Carry CER y DL. Es una **foto** del "
+        "estado actual de la app (mismo escenario y filtros que tengas seleccionados ahora), no un "
+        "modelo con fórmulas — para volver a calcular con otro escenario, generá un nuevo informe."
+    )
+
+    # Arma el contexto tomando lo que cada pestaña ya calculó en esta misma corrida del script.
+    # Uso defensivo (dir()/try-except) porque alguna pestaña puede no haber corrido si no hay datos.
+    ctx = {}
+    ctx["fecha_datos"] = pd.Timestamp(most_recent_date).strftime("%d/%m/%Y") if most_recent_date is not None else "—"
+
+    try:
+        ctx["infl_esc"] = infl_esc
+        ctx["infl_es_rem"] = (rem_val is not None and abs(infl_esc - rem_val) < 0.05)
+        ctx["rem_val_txt"] = f"{rem_val:.1f}%" if rem_val is not None else "N/D"
+        ctx["deval_esc"] = deval_esc
+        ctx["deval_source"] = deval_source
+    except Exception:
+        pass
+
+    try:
+        ctx["be_cer_short"] = round(float(be_cer_short), 2) if pd.notna(be_cer_short) else None
+        ctx["delta_cer_txt"] = (f"{delta_cer:+.1f} pp vs REM ({rem_val:.1f}%)"
+                               if "delta_cer" in dir() and rem_val is not None else None)
+    except Exception:
+        pass
+    try:
+        ctx["best_cer_txt"] = f"{best_cer['Ticker']} ({best_cer['Excess_pp']:+.1f} pp vs Fija)"
+    except Exception:
+        pass
+    try:
+        ctx["be_dl_short"] = round(float(be_dl_short), 2) if pd.notna(be_dl_short) else None
+        ctx["delta_dl_txt"] = (f"{delta_dl:+.1f} pp vs {ref_txt} ({rofex_12m:.1f}%)"
+                               if "delta_dl" in dir() and rofex_12m is not None else None)
+    except Exception:
+        pass
+    try:
+        ctx["senal_dominante"] = f"{senal} (mediana {med_excess:+.1f} pp)"
+    except Exception:
+        pass
+    try:
+        if pd.notna(be_cer_short) and rem_val is not None:
+            gap_txt = rem_val - be_cer_short
+            if gap_txt > 2:
+                ctx["lectura"] = (f"El mercado pricea {be_cer_short:.1f}% de inflación en el tramo corto, por "
+                                 f"debajo del REM ({rem_val:.1f}%): el CER luce barato, conviene cobertura si "
+                                 f"el REM se cumple.")
+            elif gap_txt < -2:
+                ctx["lectura"] = (f"El breakeven corto ({be_cer_short:.1f}%) está por encima del REM "
+                                 f"({rem_val:.1f}%): la cobertura ya está cara, la tasa fija rinde más si el "
+                                 f"REM se cumple.")
+            else:
+                ctx["lectura"] = (f"Breakeven corto ({be_cer_short:.1f}%) ≈ REM ({rem_val:.1f}%): sin carry "
+                                 f"claro por inflación; la decisión pasa por duration y liquidez.")
+    except Exception:
+        pass
+
+    ctx["bullets"] = bullets if "bullets" in dir() else []
+    ctx["caveats"] = caveats if "caveats" in dir() else []
+
+    try:
+        ctx["df_ons"] = df_ons_f if "df_ons_f" in dir() and isinstance(df_ons_f, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        ctx["df_ons"] = pd.DataFrame()
+    try:
+        ctx["df_hd"] = lb_cr if "lb_cr" in dir() and isinstance(lb_cr, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        ctx["df_hd"] = pd.DataFrame()
+    try:
+        ctx["df_spread"] = stats if "stats" in dir() and isinstance(stats, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        ctx["df_spread"] = pd.DataFrame()
+    try:
+        ctx["df_carry_cer"] = carry_cer if "carry_cer" in dir() and isinstance(carry_cer, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        ctx["df_carry_cer"] = pd.DataFrame()
+    try:
+        ctx["df_carry_dl"] = carry_dl if "carry_dl" in dir() and isinstance(carry_dl, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        ctx["df_carry_dl"] = pd.DataFrame()
+    try:
+        ctx["df_excluidos"] = susp_total if "susp_total" in dir() and isinstance(susp_total, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        ctx["df_excluidos"] = pd.DataFrame()
+
+    # ---- Preview de lo que va a llevar el informe ----
+    p1, p2, p3 = st.columns(3)
+    p1.metric("ONs en el informe", len(ctx.get("df_ons", pd.DataFrame())))
+    p2.metric("Soberanos HD", len(ctx.get("df_hd", pd.DataFrame())))
+    p3.metric("CER + DL con carry", len(ctx.get("df_carry_cer", pd.DataFrame())) + len(ctx.get("df_carry_dl", pd.DataFrame())))
+
+    try:
+        excel_bytes = build_excel_report(ctx)
+        nombre_archivo = f"renta_fija_informe_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        st.download_button(
+            "⬇️ Descargar informe Excel (.xlsx)",
+            data=excel_bytes,
+            file_name=nombre_archivo,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.caption(
+            "Hojas incluidas: **Resumen** (tablero + insights + caveats), **ONs - Valor Relativo**, "
+            "**Hard Dollar** (snapshot + spread por legislación), **Breakeven CER**, **Breakeven DL**, "
+            "y **Auditoría - Excluidos** (instrumentos fuera del fit, para que quede documentado por qué)."
+        )
+    except Exception as e:
+        st.error(f"No se pudo generar el informe: {e}")
