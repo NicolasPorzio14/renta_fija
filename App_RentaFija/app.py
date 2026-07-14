@@ -958,6 +958,15 @@ def _scatter_chart(title: str, x_title: str, y_title: str, height: float = 8.5, 
     ch.style = 2
     ch.x_axis.title = x_title
     ch.y_axis.title = y_title
+    # CRÍTICO: en un ScatterChart ambos ejes son NumericAxis y openpyxl no fija
+    # axPos por separado — sin esto, Excel real (no LibreOffice) marca el archivo
+    # como corrupto porque quedan los dos ejes como "izquierda" (axPos='l').
+    ch.x_axis.axPos = "b"
+    ch.y_axis.axPos = "l"
+    ch.x_axis.delete = False
+    ch.y_axis.delete = False
+    ch.x_axis.crosses = "min"
+    ch.y_axis.crosses = "min"
     ch.height = height
     ch.width = width
     return ch
@@ -1251,6 +1260,11 @@ def build_excel_report(ctx: dict) -> bytes:
             lc.style = 2
             lc.x_axis.title = "Fecha"
             lc.y_axis.title = "Spread (pp de TIR)"
+            lc.x_axis.axPos = "b"
+            lc.y_axis.axPos = "l"
+            lc.x_axis.delete = False
+            lc.y_axis.delete = False
+            lc.x_axis.number_format = "dd/mm/yy"
             lc.height = 8.5
             lc.width = 16.0
             date_col, dr0, dr1 = info5["Spread_Date"]
