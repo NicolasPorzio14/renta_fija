@@ -148,6 +148,17 @@ DEFAULT_ONS = {
     "PN38O": {"calificacion": "AAA(arg)", "min_nominal": 1},
     "RCCJO": {"calificacion": "AAA(arg)", "min_nominal": "N/D"},
     "VSCRO": {"calificacion": "AAA(arg)", "min_nominal": 1},
+    "DNC3O":  {"calificacion": "A+(arg)",  "min_nominal": 1},        # Edenor 2026
+    "PN35O":  {"calificacion": "AAA(arg)", "min_nominal": 1},        # PAE 2029
+    "TTCDO":  {"calificacion": "AAA(arg)", "min_nominal": 10000},    # Tecpetrol 2030
+    "PLC5O":  {"calificacion": "AAA(arg)", "min_nominal": 1000},     # PlusPetrol 2031
+    "DNCAO":  {"calificacion": "A+(arg)",  "min_nominal": 100},      # Edenor 2033
+    "GN49O":  {"calificacion": "A+(arg)",  "min_nominal": 1000},     # Genneia 2033
+    "TLCTO":  {"calificacion": "AA+(arg)", "min_nominal": 1},        # Telecom 2036
+    "PN43O":  {"calificacion": "AAA(arg)", "min_nominal": 1000},     # PAE 2037
+    "TSC4O":  {"calificacion": "B- (Fitch)", "min_nominal": 1000},   # TGS 2035 (Global -> Fitch, mismo criterio que TSC3O)
+    "VSCXO":  {"calificacion": "AAA(arg)", "min_nominal": 1000},     # Vista Oil & Gas 2038
+    "MGCRO":  {"calificacion": "AAA(arg)", "min_nominal": 1000},     # Pampa Energía 2037
 }
 
 DEFAULT_LAMINA_MAX = 10000
